@@ -27,7 +27,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    LocalFree, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
@@ -36,13 +36,10 @@ use windows_sys::Win32::Graphics::Gdi::{
     DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL,
     HDC, HFONT, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
-};
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
 };
-use windows_sys::Win32::System::DataExchange::{GetClipboardOwner, GetClipboardSequenceNumber};
+use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::{
@@ -269,40 +266,6 @@ fn add_image(a: &mut App, w: usize, h: usize, rgba: Vec<u8>) {
     }
 }
 
-/// Lower-cased base name of the process that currently owns the clipboard,
-/// e.g. "rdpclip.exe" for content redirected from the RDP/AVD client machine.
-fn clipboard_owner_exe() -> Option<String> {
-    unsafe {
-        let owner = GetClipboardOwner();
-        if owner.is_null() {
-            return None;
-        }
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(owner, &mut pid);
-        if pid == 0 {
-            return None;
-        }
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if h.is_null() {
-            return None;
-        }
-        let mut buf = [0u16; 260];
-        let mut size = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
-        CloseHandle(h);
-        if ok == 0 {
-            return None;
-        }
-        let full = String::from_utf16_lossy(&buf[..size as usize]);
-        Some(
-            full.rsplit(['\\', '/'])
-                .next()
-                .unwrap_or(&full)
-                .to_lowercase(),
-        )
-    }
-}
-
 /// Best-effort wipe of a String's backing bytes before it is dropped.
 fn scrub_string(s: &mut String) {
     unsafe {
@@ -331,11 +294,6 @@ fn poll_clip(a: &mut App) {
         return;
     }
     a.last_seq = seq;
-    // On this VM (RDP/AVD), clips redirected from the local client machine are
-    // owned by rdpclip.exe — ignore them so we only keep clips made in the VM.
-    if clipboard_owner_exe().as_deref() == Some("rdpclip.exe") {
-        return;
-    }
     let img = a.clipboard.as_mut().and_then(|c| c.get_image().ok());
     if let Some(img) = img {
         add_image(a, img.width, img.height, img.bytes.into_owned());
