@@ -41,3 +41,7 @@ I wanted a clipboard manager that was instant, stayed out of the way, and didn't
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+Built by Brian Jones — [hologramhacks.com](https://hologramhacks.com)
