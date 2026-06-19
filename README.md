@@ -14,15 +14,27 @@ Grab the latest `clipstack.exe` from the [**Releases**](https://github.com/Holog
 
 First launch shows a Windows SmartScreen warning (it's unsigned) — click **More info → Run anyway**.
 
+## Using it
+
+ClipStack sits in your system tray. Everything is driven by the mouse:
+
+| Action | What happens |
+|---|---|
+| **Middle-click** anywhere | Opens the history popup at your cursor |
+| **Mouse wheel** (popup open) | Scrolls through older clips |
+| **Left-click** a row | Copies that clip *and* pastes it into the field you were in |
+| **Click the ✕** on a row | Removes that clip from history |
+| **Right-click** a clip | Pins it with a label (kept until you remove it) |
+| **Right-click** a pin | Unpins it |
+| **Right-click the tray icon** | Pause capture · Clear history · Quit |
+
 ## What it does
 
-- Keeps your last **50 clips** (text *and* images)
-- **Middle-click** pops a small list right at your cursor — no window stealing focus
-- **Left-click** an item → copies it *and* pastes it into the field that had focus
-- **Right-click** an item → pin it (with a label) to a persistent section; right-click a pin to remove it
-- **Pinned secrets are masked on screen and stored DPAPI-encrypted on disk** — passwords/tokens never sit in plaintext
-- **Tray icon**: pause capture, clear history, quit
-- **Tiny binary** — optimized release build (LTO, stripped, `panic = abort`)
+- Keeps your last **50 clips** — text *and* images
+- The popup opens right at your cursor and **never steals focus** from what you're doing
+- **Pinned secrets** are masked on screen and stored DPAPI-encrypted on disk — passwords/tokens never sit in plaintext
+- **No cloud, no network** — your clipboard never leaves your machine
+- **Tiny** — a single ~0.5 MB exe, no runtime, no dependencies
 
 ## Build from source
 
