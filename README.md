@@ -2,7 +2,7 @@
 
 A tiny clipboard-history popup for Windows. Middle-click anywhere, pick from your last 50 clips, and it pastes straight into whatever field you were typing in.
 
-Written in Rust — raw Win32, no UI framework, single file. Built with **agentic engineering**: AI agents I built and direct write most of the code, and every change is human-reviewed before it lands.
+Written in Rust — raw Win32, no UI framework, single file.
 
 ## Download & run (no Rust needed)
 
@@ -36,7 +36,7 @@ Everything runs single-threaded on one Win32 message loop. The low-level mouse h
 
 ## Why I built it
 
-I wanted a clipboard manager that was instant, stayed out of the way, and didn't ship my clipboard off to a cloud service — so I built one, in Rust, with my agentic engineering setup. It's small, fast, and mine.
+I wanted a clipboard manager that was instant, stayed out of the way, and didn't ship my clipboard off to a cloud service — so I built one, in Rust. It's small, fast, and mine.
 
 ## License
 
