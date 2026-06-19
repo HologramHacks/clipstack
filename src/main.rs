@@ -72,6 +72,10 @@ const ID_QUIT: usize = 103;
 const TIMER_CLIP: usize = 1;
 const HC_ACTION: i32 = 0;
 
+/// App icon (.ico with several sizes), baked into the exe and turned into an
+/// HICON at runtime so the build needs no resource compiler.
+const ICON_BYTES: &[u8] = include_bytes!("../assets/clipstack.ico");
+
 // ---- Data model -----------------------------------------------------------
 
 struct ImageClip {
@@ -1126,6 +1130,23 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     DestroyMenu(menu);
 }
 
+/// Realize the embedded icon into an HICON at the requested size, falling back
+/// to the stock application icon if anything goes wrong.
+unsafe fn load_app_icon(cx: i32, cy: i32) -> HICON {
+    let offset = LookupIconIdFromDirectoryEx(ICON_BYTES.as_ptr(), 1, cx, cy, LR_DEFAULTCOLOR);
+    if offset == 0 {
+        return LoadIconW(null_mut(), IDI_APPLICATION);
+    }
+    let bits = ICON_BYTES.as_ptr().add(offset as usize);
+    let len = (ICON_BYTES.len() - offset as usize) as u32;
+    let hicon = CreateIconFromResourceEx(bits, len, 1, 0x0003_0000, cx, cy, LR_DEFAULTCOLOR);
+    if hicon.is_null() {
+        LoadIconW(null_mut(), IDI_APPLICATION)
+    } else {
+        hicon
+    }
+}
+
 unsafe fn add_tray(hwnd: HWND) {
     let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
     nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -1133,7 +1154,9 @@ unsafe fn add_tray(hwnd: HWND) {
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_APP_TRAY;
-    nid.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+    let cx = GetSystemMetrics(SM_CXSMICON);
+    let cy = GetSystemMetrics(SM_CYSMICON);
+    nid.hIcon = load_app_icon(cx, cy);
     let tip = wide("ClipStack \u{2014} middle-click for clipboard history");
     let n = tip.len().min(nid.szTip.len());
     nid.szTip[..n].copy_from_slice(&tip[..n]);
