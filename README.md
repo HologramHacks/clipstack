@@ -4,6 +4,12 @@ A tiny clipboard-history popup for Windows. Middle-click anywhere, pick from you
 
 Written in Rust — raw Win32, no UI framework, single file. Built with **agentic engineering**: AI agents I built and direct write most of the code, and every change is human-reviewed before it lands.
 
+## Download & run (no Rust needed)
+
+Grab the latest `clipstack.exe` from the [**Releases**](https://github.com/HologramHacks/clipstack/releases/latest) page and run it. That's it — no installer, no runtime, no dependencies. It's a single ~0.5 MB file that lives in your system tray.
+
+First launch shows a Windows SmartScreen warning (it's unsigned) — click **More info → Run anyway**.
+
 ## What it does
 
 - Keeps your last **50 clips** (text *and* images)
@@ -14,9 +20,9 @@ Written in Rust — raw Win32, no UI framework, single file. Built with **agenti
 - **Tray icon**: pause capture, clear history, quit
 - **Tiny binary** — optimized release build (LTO, stripped, `panic = abort`)
 
-## Build
+## Build from source
 
-Needs [Rust](https://rustup.rs/) and Windows.
+Only needed if you want to compile or change it yourself. Needs [Rust](https://rustup.rs/) and Windows.
 
 ```sh
 cargo build --release
