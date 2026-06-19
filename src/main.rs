@@ -16,9 +16,9 @@
 // the label dialog's nested loop) — borrows are scoped accordingly.
 #![windows_subsystem = "windows"]
 #![allow(non_snake_case)]
-#![allow(static_mut_refs)]
 
 use std::borrow::Cow;
+use std::cell::{RefCell, RefMut};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
@@ -134,12 +134,19 @@ struct App {
     popup_y: i32,
 }
 
-static mut G: Option<App> = None;
+struct Global(RefCell<Option<App>>);
+// SAFETY: ClipStack is single-threaded — the message loop, the mouse hook, and
+// the window procedure all run on the one UI thread, so `G` is never actually
+// shared across threads. The RefCell enforces the single-borrow rule at runtime,
+// turning any reentrant aliasing slip into a clean panic instead of UB.
+unsafe impl Sync for Global {}
+static G: Global = Global(RefCell::new(None));
 
-fn app() -> &'static mut App {
-    // SAFETY: only called on the single UI thread; callers never hold two live
-    // borrows at once.
-    unsafe { (*std::ptr::addr_of_mut!(G)).as_mut().unwrap() }
+/// Exclusive access to the single global App. Borrows are kept short and never
+/// held across a Win32 call that pumps a message we handle, so reentrancy never
+/// aliases.
+fn app() -> RefMut<'static, App> {
+    RefMut::map(G.0.borrow_mut(), |o| o.as_mut().expect("App not initialized"))
 }
 
 // ---- Small helpers --------------------------------------------------------
@@ -898,7 +905,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         let msg = wp as u32;
         let info = &*(lp as *const MSLLHOOKSTRUCT);
         let pt = info.pt;
-        let a = app();
+        let mut a = app();
         match msg {
             WM_MBUTTONDOWN if !a.visible && !a.paused && !a.modal => {
                 a.target = GetForegroundWindow();
@@ -935,15 +942,15 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_APP_SHOW => {
-            show_popup(app(), wp as i32, lp as i32);
+            show_popup(&mut app(), wp as i32, lp as i32);
             0
         }
         WM_APP_HIDE => {
-            hide_popup(app());
+            hide_popup(&mut app());
             0
         }
         WM_APP_SCROLL => {
-            let a = app();
+            let mut a = app();
             let max_scroll = a.history.len().saturating_sub(a.history.len().min(VISIBLE));
             match wp {
                 1 => a.scroll = a.scroll.saturating_sub(SCROLL_STEP),
@@ -951,7 +958,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 _ => {}
             }
             a.hovered = -1;
-            rebuild_rows(a);
+            rebuild_rows(&mut *a);
             InvalidateRect(hwnd, null(), 1);
             0
         }
@@ -959,15 +966,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if wp == TIMER_CLIP {
                 // Don't ingest new clips while a popup or modal dialog is open —
                 // it would shift the history indices the on-screen rows point at.
-                let a = app();
+                let mut a = app();
                 if !a.visible && !a.modal {
-                    poll_clip(a);
+                    poll_clip(&mut *a);
                 }
             }
             0
         }
         WM_MOUSEMOVE => {
-            let a = app();
+            let mut a = app();
             let (_x, y) = lo_hi(lp);
             if !a.tracking_leave {
                 let mut tme = TRACKMOUSEEVENT {
@@ -979,7 +986,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 TrackMouseEvent(&mut tme);
                 a.tracking_leave = true;
             }
-            let row = row_at(a, y).map(|i| i as i32).unwrap_or(-1);
+            let row = row_at(&*a, y).map(|i| i as i32).unwrap_or(-1);
             if row != a.hovered {
                 a.hovered = row;
                 InvalidateRect(hwnd, null(), 1);
@@ -987,7 +994,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_MOUSELEAVE => {
-            let a = app();
+            let mut a = app();
             a.hovered = -1;
             a.tracking_leave = false;
             InvalidateRect(hwnd, null(), 1);
@@ -996,19 +1003,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_LBUTTONUP => {
             let (x, y) = lo_hi(lp);
             let target = {
-                let a = app();
-                match row_at(a, y) {
+                let mut a = app();
+                match row_at(&*a, y) {
                     Some(idx) if x >= a.width - a.item_h => {
                         // Clicked the ✕ delete affordance on the right edge.
-                        delete_row(a, idx);
+                        delete_row(&mut *a, idx);
                         if a.history.is_empty() && a.pins.is_empty() {
-                            hide_popup(a);
+                            hide_popup(&mut *a);
                         } else {
-                            relayout(a);
+                            relayout(&mut *a);
                         }
                         null_mut()
                     }
-                    Some(idx) => commit_row(a, idx),
+                    Some(idx) => commit_row(&mut *a, idx),
                     None => null_mut(),
                 }
             };
@@ -1023,15 +1030,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let (_x, y) = lo_hi(lp);
             let kind = {
                 let a = app();
-                row_at(a, y).map(|idx| a.rows[idx].kind)
+                row_at(&*a, y).map(|idx| a.rows[idx].kind)
             };
             match kind {
                 Some(RowKind::Pin(j)) => {
-                    let a = app();
+                    let mut a = app();
                     let mut p = a.pins.remove(j);
                     scrub_string(&mut p.secret);
-                    save_pins(a);
-                    relayout(a);
+                    save_pins(&*a);
+                    relayout(&mut *a);
                 }
                 Some(RowKind::Hist(i)) => {
                     let secret = {
@@ -1043,19 +1050,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     };
                     if let Some(secret) = secret {
                         let (parent, hinst) = {
-                            let a = app();
+                            let mut a = app();
                             a.modal = true;
                             (a.hwnd, a.hinst)
                         };
-                        hide_popup(app());
+                        hide_popup(&mut app());
                         let label = prompt_text(parent, hinst, "Pin to ClipStack", "Label for this pin:", "");
                         app().modal = false;
                         if let Some(label) = label {
                             let label = label.trim().to_string();
                             if !label.is_empty() {
-                                let a = app();
+                                let mut a = app();
                                 a.pins.push(Pin { label, secret });
-                                save_pins(a);
+                                save_pins(&*a);
                             }
                         }
                     }
@@ -1077,12 +1084,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_COMMAND => {
             match (wp & 0xffff) as usize {
-                ID_PAUSE => app().paused = !app().paused,
+                ID_PAUSE => {
+                    let p = !app().paused;
+                    app().paused = p;
+                }
                 ID_CLEAR => {
-                    let a = app();
+                    let mut a = app();
                     a.history.iter_mut().for_each(scrub_clip);
                     a.history.clear();
-                    hide_popup(a);
+                    hide_popup(&mut *a);
                 }
                 ID_QUIT => {
                     DestroyWindow(hwnd);
@@ -1131,7 +1141,7 @@ unsafe fn add_tray(hwnd: HWND) {
 }
 
 unsafe fn cleanup(hwnd: HWND) {
-    let a = app();
+    let mut a = app();
     let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
     nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
     nid.hWnd = hwnd;
@@ -1205,7 +1215,7 @@ fn main() {
         let clipboard = arboard::Clipboard::new().ok();
         let pins = load_pins();
 
-        G = Some(App {
+        *G.0.borrow_mut() = Some(App {
             hwnd: null_mut(),
             hook: 0,
             hinst,
@@ -1249,7 +1259,7 @@ fn main() {
         app().hwnd = hwnd;
 
         add_tray(hwnd);
-        poll_clip(app()); // seed with whatever's on the clipboard now
+        poll_clip(&mut app()); // seed with whatever's on the clipboard now
 
         let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), hinst, 0);
         app().hook = hook as isize;
