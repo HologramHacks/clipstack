@@ -13,7 +13,7 @@
 // callback and the window procedure both execute on this one thread, so the
 // global `App` is only ever touched there. We take a `&mut App` for one handler
 // and never hold it across a Win32 call that pumps messages (TrackPopupMenu,
-// the label dialog's nested loop) — borrows are scoped accordingly.
+// SetForegroundWindow) — borrows are scoped accordingly.
 #![windows_subsystem = "windows"]
 #![allow(non_snake_case)]
 
@@ -27,14 +27,14 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    LocalFree, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    LocalFree, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    FrameRect, GetStockObject, InvalidateRect, SelectObject, SetBkMode, SetTextColor, StretchDIBits,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_GUI_FONT,
-    DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL,
-    HDC, HFONT, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
+    EndPaint, FillRect, FrameRect, GetTextExtentPoint32W, InvalidateRect, SelectObject, SetBkMode,
+    SetTextColor, SetWindowRgn, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
+    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, FW_NORMAL, HDC, HFONT, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
@@ -99,6 +99,16 @@ struct Pin {
     secret: String,
 }
 
+/// In-progress inline pin labeling. While this is `Some`, the right-clicked
+/// history row renders as a text field and the popup briefly holds keyboard
+/// focus so it can receive WM_CHAR.
+struct Edit {
+    hist: usize,     // history index being labeled
+    secret: String,  // the clip text that will become the pin's secret
+    label: Vec<u16>, // label typed so far (UTF-16, no NUL)
+    restore: HWND,   // foreground window to hand focus back to when done
+}
+
 #[derive(Clone, Copy)]
 enum RowKind {
     Sep,
@@ -115,7 +125,6 @@ struct VRow {
 struct App {
     hwnd: HWND,
     hook: isize,
-    hinst: windows_sys::Win32::Foundation::HINSTANCE,
     clipboard: Option<arboard::Clipboard>,
     history: Vec<Clip>,
     pins: Vec<Pin>,
@@ -125,7 +134,8 @@ struct App {
     target: HWND,
     paused: bool,
     visible: bool,
-    modal: bool,
+    edit: Option<Edit>, // inline pin-labeling in progress
+    caret_on: bool,     // caret blink phase while editing
     swallow_mup: bool,
     hovered: i32, // index into `rows`, or -1
     tracking_leave: bool,
@@ -163,9 +173,21 @@ fn wide_no_nul(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
-fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
 }
+
+// Dark command-palette palette.
+const COL_BG: COLORREF = rgb(0x1c, 0x1f, 0x26); // window background
+const COL_TEXT: COLORREF = rgb(0xe8, 0xe8, 0xea); // primary text
+const COL_DIM: COLORREF = rgb(0x8a, 0x8f, 0x99); // secondary text (image dims, placeholder)
+const COL_HOVER_BG: COLORREF = rgb(0x26, 0x2b, 0x34); // hovered row tint
+const COL_ACCENT: COLORREF = rgb(0xff, 0x7a, 0x33); // orange accent (from the icon)
+const COL_SEP: COLORREF = rgb(0x2e, 0x33, 0x3d); // separators + frame
+const COL_PIN_BULLET: COLORREF = rgb(0x6b, 0x72, 0x80); // masked pin bullets
+const COL_DELETE: COLORREF = rgb(0xff, 0x6b, 0x6b); // hovered-row ✕ delete glyph
+const COL_FIELD_BG: COLORREF = rgb(0x13, 0x16, 0x1b); // inline label input background
+const CORNER_RADIUS: i32 = 12; // rounded-corner diameter for the window region
 
 fn lo_hi(lp: LPARAM) -> (i32, i32) {
     let v = lp as u32;
@@ -488,9 +510,9 @@ fn show_popup(a: &mut App, cx: i32, cy: i32) {
     }
     let dpi = unsafe { GetDpiForWindow(a.hwnd) };
     let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
-    a.item_h = (30.0 * scale) as i32;
-    a.sep_h = (11.0 * scale) as i32;
-    a.pad = (5.0 * scale) as i32;
+    a.item_h = (34.0 * scale) as i32;
+    a.sep_h = (12.0 * scale) as i32;
+    a.pad = (6.0 * scale) as i32;
     a.width = (460.0 * scale) as i32;
 
     if !a.font.is_null() {
@@ -541,10 +563,18 @@ fn show_popup(a: &mut App, cx: i32, cy: i32) {
 
     unsafe {
         SetWindowPos(a.hwnd, HWND_TOPMOST, xx, yy, a.width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        round_window(a.hwnd, a.width, height);
         InvalidateRect(a.hwnd, null(), 1);
     }
     a.visible = true;
     a.hovered = -1;
+}
+
+/// Clip the window to a rounded rectangle. The system takes ownership of the
+/// region, so we never free it; replacing it on the next resize is fine.
+unsafe fn round_window(hwnd: HWND, w: i32, h: i32) {
+    let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, CORNER_RADIUS, CORNER_RADIUS);
+    SetWindowRgn(hwnd, rgn, 1);
 }
 
 fn relayout(a: &mut App) {
@@ -556,12 +586,24 @@ fn relayout(a: &mut App) {
     let height = rows_height(a);
     unsafe {
         SetWindowPos(a.hwnd, HWND_TOPMOST, a.popup_x, a.popup_y, a.width, height, SWP_NOACTIVATE);
+        round_window(a.hwnd, a.width, height);
         InvalidateRect(a.hwnd, null(), 1);
     }
     a.hovered = -1;
 }
 
 fn hide_popup(a: &mut App) {
+    // Abandon any in-progress label edit (scrub the secret, restore the
+    // no-activate style we dropped to take focus). Foreground naturally moves
+    // to whatever the user clicked.
+    if let Some(mut ed) = a.edit.take() {
+        scrub_string(&mut ed.secret);
+        unsafe {
+            let ex = GetWindowLongPtrW(a.hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(a.hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE as isize);
+        }
+    }
+    a.caret_on = false;
     unsafe { ShowWindow(a.hwnd, SW_HIDE) };
     a.visible = false;
     a.hovered = -1;
@@ -595,6 +637,52 @@ unsafe fn draw_x(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
         &mut tr,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
     );
+}
+
+/// Width in pixels of `text` in the font currently selected into `hdc`.
+unsafe fn text_width(hdc: HDC, text: &[u16]) -> i32 {
+    let mut sz: SIZE = std::mem::zeroed();
+    GetTextExtentPoint32W(hdc, text.as_ptr(), text.len() as i32, &mut sz);
+    sz.cx
+}
+
+/// A 2px vertical caret bar.
+unsafe fn draw_caret(hdc: HDC, x: i32, top: i32, bottom: i32) {
+    fill_color(hdc, x, top, x + 2, bottom, COL_TEXT);
+}
+
+/// Render the row that's being inline-labeled as a focused text field.
+unsafe fn paint_edit_row(hdc: HDC, a: &App, r: &VRow, text_left: i32) {
+    let ed = match a.edit.as_ref() {
+        Some(e) => e,
+        None => return,
+    };
+    let inset = (a.pad / 2).max(1);
+    let (fx0, fx1) = (text_left - a.pad, a.width - a.pad);
+    let (fy0, fy1) = (r.top + inset, r.bottom - inset);
+    fill_color(hdc, fx0, fy0, fx1, fy1, COL_FIELD_BG);
+    let frame = CreateSolidBrush(COL_ACCENT);
+    let fr = RECT { left: fx0, top: fy0, right: fx1, bottom: fy1 };
+    FrameRect(hdc, &fr, frame);
+    DeleteObject(frame as _);
+
+    let tr = a.width - a.pad * 2;
+    let (ctop, cbot) = (fy0 + inset, fy1 - inset);
+    if ed.label.is_empty() {
+        if a.caret_on {
+            draw_caret(hdc, text_left, ctop, cbot);
+        }
+        SetTextColor(hdc, COL_DIM);
+        let hint = wide_no_nul("Type a label  \u{2014}  Enter to pin, Esc to cancel");
+        draw_text_row(hdc, text_left + a.pad, r.top, tr, r.bottom, &hint);
+    } else {
+        SetTextColor(hdc, rgb(255, 255, 255));
+        draw_text_row(hdc, text_left, r.top, tr, r.bottom, &ed.label);
+        if a.caret_on {
+            let cx = (text_left + text_width(hdc, &ed.label) + 1).min(tr - 2);
+            draw_caret(hdc, cx, ctop, cbot);
+        }
+    }
 }
 
 unsafe fn draw_thumb(hdc: HDC, ic: &ImageClip, x: i32, y: i32, maxh: i32) -> i32 {
@@ -632,49 +720,61 @@ unsafe fn paint(hwnd: HWND) {
     let mut rc: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut rc);
 
-    fill_color(hdc, 0, 0, rc.right, rc.bottom, rgb(252, 252, 252));
+    fill_color(hdc, 0, 0, rc.right, rc.bottom, COL_BG);
     let oldf = SelectObject(hdc, a.font as _);
     SetBkMode(hdc, TRANSPARENT as i32);
 
+    let text_left = a.pad * 2;
     let text_right = a.width - a.item_h; // reserve the right column for the ✕
+    let bar_w = (a.pad / 2).max(2); // hovered-row accent bar
     for (idx, r) in a.rows.iter().enumerate() {
         let hovered = idx as i32 == a.hovered;
         match r.kind {
             RowKind::Sep => {
                 let mid = (r.top + r.bottom) / 2;
-                fill_color(hdc, a.pad * 2, mid, a.width - a.pad * 2, mid + 1, rgb(208, 208, 208));
+                fill_color(hdc, text_left, mid, a.width - text_left, mid + 1, COL_SEP);
             }
             RowKind::Hist(i) => {
+                if a.edit.as_ref().map_or(false, |e| e.hist == i) {
+                    paint_edit_row(hdc, &*a, r, text_left);
+                    continue;
+                }
                 if hovered {
-                    fill_color(hdc, 0, r.top, a.width, r.bottom, rgb(0, 120, 215));
+                    fill_color(hdc, 0, r.top, a.width, r.bottom, COL_HOVER_BG);
+                    fill_color(hdc, 0, r.top, bar_w, r.bottom, COL_ACCENT);
                 }
                 match &a.history[i] {
                     Clip::Text(s) => {
-                        SetTextColor(hdc, if hovered { rgb(255, 255, 255) } else { rgb(30, 30, 30) });
-                        draw_text_row(hdc, a.pad * 2, r.top, text_right, r.bottom, &make_preview(s));
+                        SetTextColor(hdc, if hovered { rgb(255, 255, 255) } else { COL_TEXT });
+                        draw_text_row(hdc, text_left, r.top, text_right, r.bottom, &make_preview(s));
                     }
                     Clip::Image(ic) => {
-                        let dw = draw_thumb(hdc, ic, a.pad * 2, r.top + a.pad, a.item_h - a.pad * 2);
-                        let tx = a.pad * 2 + dw + a.pad * 2;
-                        SetTextColor(hdc, if hovered { rgb(235, 235, 235) } else { rgb(120, 120, 120) });
+                        let dw = draw_thumb(hdc, ic, text_left, r.top + a.pad, a.item_h - a.pad * 2);
+                        let tx = text_left + dw + a.pad * 2;
+                        SetTextColor(hdc, if hovered { rgb(220, 220, 225) } else { COL_DIM });
                         let label = format!("image  {} \u{00d7} {}", ic.w, ic.h);
                         draw_text_row(hdc, tx, r.top, text_right, r.bottom, &wide_no_nul(&label));
                     }
                 }
                 if hovered {
-                    SetTextColor(hdc, rgb(255, 255, 255));
+                    SetTextColor(hdc, COL_DELETE);
                     draw_x(hdc, text_right, r.top, a.width, r.bottom);
                 }
             }
             RowKind::Pin(j) => {
                 if hovered {
-                    fill_color(hdc, 0, r.top, a.width, r.bottom, rgb(0, 120, 215));
+                    fill_color(hdc, 0, r.top, a.width, r.bottom, COL_HOVER_BG);
+                    fill_color(hdc, 0, r.top, bar_w, r.bottom, COL_ACCENT);
                 }
-                SetTextColor(hdc, if hovered { rgb(255, 255, 255) } else { rgb(70, 70, 70) });
-                let txt = format!("{}    {}", "\u{2022}".repeat(8), a.pins[j].label);
-                draw_text_row(hdc, a.pad * 2, r.top, text_right, r.bottom, &wide_no_nul(&txt));
+                // Dim masked bullets, then the label in bright text after them.
+                let bullets = wide_no_nul(&"\u{2022}".repeat(8));
+                SetTextColor(hdc, COL_PIN_BULLET);
+                draw_text_row(hdc, text_left, r.top, text_right, r.bottom, &bullets);
+                let lx = text_left + text_width(hdc, &bullets) + a.pad * 3;
+                SetTextColor(hdc, if hovered { rgb(255, 255, 255) } else { COL_TEXT });
+                draw_text_row(hdc, lx, r.top, text_right, r.bottom, &wide_no_nul(&a.pins[j].label));
                 if hovered {
-                    SetTextColor(hdc, rgb(255, 255, 255));
+                    SetTextColor(hdc, COL_DELETE);
                     draw_x(hdc, text_right, r.top, a.width, r.bottom);
                 }
             }
@@ -682,7 +782,7 @@ unsafe fn paint(hwnd: HWND) {
     }
 
     SelectObject(hdc, oldf);
-    let border = CreateSolidBrush(rgb(150, 150, 150));
+    let border = CreateSolidBrush(COL_SEP);
     FrameRect(hdc, &rc, border);
     DeleteObject(border as _);
     EndPaint(hwnd, &ps);
@@ -752,153 +852,38 @@ fn send_paste() {
     }
 }
 
-// ---- Label input dialog ---------------------------------------------------
+// ---- Inline pin labeling --------------------------------------------------
 
-struct DlgData {
-    done: bool,
-    ok: bool,
-    edit: HWND,
-}
-
-unsafe extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    let data = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DlgData;
-    match msg {
-        WM_COMMAND => {
-            if !data.is_null() {
-                match (wp & 0xffff) as i32 {
-                    x if x == IDOK as i32 => {
-                        (*data).ok = true;
-                        (*data).done = true;
-                    }
-                    x if x == IDCANCEL as i32 => (*data).done = true,
-                    _ => {}
-                }
-            }
-            0
-        }
-        WM_CLOSE => {
-            if !data.is_null() {
-                (*data).done = true;
-            }
-            0
-        }
-        _ => DefWindowProcW(hwnd, msg, wp, lp),
-    }
-}
-
-fn prompt_text(
-    parent: HWND,
-    hinst: windows_sys::Win32::Foundation::HINSTANCE,
-    title: &str,
-    label: &str,
-    default: &str,
-) -> Option<String> {
-    unsafe {
-        let mut data = DlgData { done: false, ok: false, edit: null_mut() };
-        let (cw, ch) = (380, 158);
-        let mut wa: RECT = std::mem::zeroed();
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut _ as _, 0);
-        let x = (wa.left + wa.right) / 2 - cw / 2;
-        let y = (wa.top + wa.bottom) / 2 - ch / 2;
-
-        let cls = wide("ClipStackInput");
-        let t = wide(title);
-        let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
-            cls.as_ptr(),
-            t.as_ptr(),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-            x,
-            y,
-            cw,
-            ch,
-            parent,
-            null_mut(),
-            hinst,
-            null(),
-        );
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut data as *mut _ as isize);
-
-        let font = GetStockObject(DEFAULT_GUI_FONT);
-        let mk = |class: &[u16], text: Vec<u16>, style: u32, ex: u32, bx, by, bw, bh, id: usize| {
-            let h = CreateWindowExW(
-                ex,
-                class.as_ptr(),
-                text.as_ptr(),
-                style,
-                bx,
-                by,
-                bw,
-                bh,
-                hwnd,
-                id as *mut c_void,
-                hinst,
-                null(),
-            );
-            SendMessageW(h, WM_SETFONT, font as usize, 1);
-            h
+/// Finish an in-progress inline label edit. On `commit` with a non-empty label,
+/// the clip is pinned and the pins file is rewritten; either way the no-activate
+/// style is restored and keyboard focus is handed back to the app the user came
+/// from. The popup stays open so a freshly added pin is visible.
+unsafe fn end_edit(commit: bool) {
+    let (hwnd, restore) = {
+        let mut a = app();
+        let mut ed = match a.edit.take() {
+            Some(e) => e,
+            None => return,
         };
-        let static_cls = wide("STATIC");
-        let edit_cls = wide("EDIT");
-        let btn_cls = wide("BUTTON");
-        mk(&static_cls, wide(label), WS_CHILD | WS_VISIBLE, 0, 14, 12, cw - 40, 20, 0);
-        let h_edit = mk(
-            &edit_cls,
-            wide(default),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
-            WS_EX_CLIENTEDGE,
-            14,
-            38,
-            cw - 44,
-            26,
-            0,
-        );
-        data.edit = h_edit;
-        mk(
-            &btn_cls,
-            wide("OK"),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
-            0,
-            cw - 196,
-            82,
-            84,
-            30,
-            IDOK as usize,
-        );
-        mk(
-            &btn_cls,
-            wide("Cancel"),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            0,
-            cw - 102,
-            82,
-            84,
-            30,
-            IDCANCEL as usize,
-        );
-
-        ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
-        SetFocus(h_edit);
-
-        let mut msg: MSG = std::mem::zeroed();
-        while !data.done && GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            if IsDialogMessageW(hwnd, &msg) == 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+        if commit {
+            let label = String::from_utf16_lossy(&ed.label).trim().to_string();
+            if !label.is_empty() {
+                let secret = std::mem::take(&mut ed.secret);
+                a.pins.push(Pin { label, secret });
+                save_pins(&*a);
             }
         }
-
-        let result = if data.ok {
-            let len = GetWindowTextLengthW(h_edit);
-            let mut buf = vec![0u16; (len + 1) as usize];
-            let n = GetWindowTextW(h_edit, buf.as_mut_ptr(), len + 1);
-            Some(String::from_utf16_lossy(&buf[..n as usize]))
-        } else {
-            None
-        };
-        DestroyWindow(hwnd);
-        result
+        scrub_string(&mut ed.secret); // no-op if the secret was moved into the pin
+        a.caret_on = false;
+        relayout(&mut *a); // resize for the (possibly) new pin and repaint
+        (a.hwnd, ed.restore)
+    };
+    // Restore the no-activate style we dropped to grab focus, then hand the
+    // keyboard back to wherever the user was typing before.
+    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE as isize);
+    if !restore.is_null() {
+        SetForegroundWindow(restore);
     }
 }
 
@@ -911,7 +896,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         let pt = info.pt;
         let mut a = app();
         match msg {
-            WM_MBUTTONDOWN if !a.visible && !a.paused && !a.modal => {
+            WM_MBUTTONDOWN if !a.visible && !a.paused => {
                 a.target = GetForegroundWindow();
                 a.swallow_mup = true;
                 PostMessageW(a.hwnd, WM_APP_SHOW, pt.x as usize, pt.y as isize);
@@ -955,6 +940,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_SCROLL => {
             let mut a = app();
+            if a.edit.is_some() {
+                return 0; // freeze the list while labeling so indices can't shift
+            }
             let max_scroll = a.history.len().saturating_sub(a.history.len().min(VISIBLE));
             match wp {
                 1 => a.scroll = a.scroll.saturating_sub(SCROLL_STEP),
@@ -968,10 +956,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER => {
             if wp == TIMER_CLIP {
-                // Don't ingest new clips while a popup or modal dialog is open —
-                // it would shift the history indices the on-screen rows point at.
                 let mut a = app();
-                if !a.visible && !a.modal {
+                if a.edit.is_some() {
+                    // Blink the label caret while editing.
+                    a.caret_on = !a.caret_on;
+                    InvalidateRect(hwnd, null(), 0);
+                } else if !a.visible {
+                    // Don't ingest new clips while the popup is open — it would
+                    // shift the history indices the on-screen rows point at.
                     poll_clip(&mut *a);
                 }
             }
@@ -979,6 +971,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MOUSEMOVE => {
             let mut a = app();
+            if a.edit.is_some() {
+                return 0; // no hover changes while a label field is open
+            }
             let (_x, y) = lo_hi(lp);
             if !a.tracking_leave {
                 let mut tme = TRACKMOUSEEVENT {
@@ -1005,6 +1000,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_LBUTTONUP => {
+            if app().edit.is_some() {
+                return 0; // ignore clicks on rows while labeling; Enter/Esc only
+            }
             let (x, y) = lo_hi(lp);
             let target = {
                 let mut a = app();
@@ -1031,6 +1029,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_RBUTTONUP => {
+            if app().edit.is_some() {
+                return 0; // already labeling; ignore further right-clicks
+            }
             let (_x, y) = lo_hi(lp);
             let kind = {
                 let a = app();
@@ -1045,33 +1046,89 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     relayout(&mut *a);
                 }
                 Some(RowKind::Hist(i)) => {
-                    let secret = {
-                        let a = app();
-                        match &a.history[i] {
+                    // Begin inline labeling: the row turns into a text field.
+                    // Only text clips can be pinned (an image isn't a password).
+                    let hwnd2 = {
+                        let mut a = app();
+                        let secret = match &a.history[i] {
                             Clip::Text(s) => Some(s.clone()),
-                            Clip::Image(_) => None, // can't pin an image as a password
+                            Clip::Image(_) => None,
+                        };
+                        match secret {
+                            Some(secret) => {
+                                let restore = a.target;
+                                a.edit = Some(Edit { hist: i, secret, label: Vec::new(), restore });
+                                a.caret_on = true;
+                                Some(a.hwnd)
+                            }
+                            None => None,
                         }
                     };
-                    if let Some(secret) = secret {
-                        let (parent, hinst) = {
-                            let mut a = app();
-                            a.modal = true;
-                            (a.hwnd, a.hinst)
-                        };
-                        hide_popup(&mut app());
-                        let label = prompt_text(parent, hinst, "Pin to ClipStack", "Label for this pin:", "");
-                        app().modal = false;
-                        if let Some(label) = label {
-                            let label = label.trim().to_string();
-                            if !label.is_empty() {
-                                let mut a = app();
-                                a.pins.push(Pin { label, secret });
-                                save_pins(&*a);
-                            }
-                        }
+                    if let Some(hwnd2) = hwnd2 {
+                        // Briefly drop WS_EX_NOACTIVATE and take keyboard focus so
+                        // the popup receives WM_CHAR. end_edit/hide_popup restore it.
+                        let ex = GetWindowLongPtrW(hwnd2, GWL_EXSTYLE);
+                        SetWindowLongPtrW(hwnd2, GWL_EXSTYLE, ex & !(WS_EX_NOACTIVATE as isize));
+                        SetForegroundWindow(hwnd2);
+                        SetFocus(hwnd2);
+                        InvalidateRect(hwnd2, null(), 1);
                     }
                 }
                 _ => {}
+            }
+            0
+        }
+        WM_KEYDOWN => {
+            if app().edit.is_none() {
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            match wp as u16 {
+                0x1B => end_edit(false), // VK_ESCAPE: cancel
+                0x0D => {
+                    // VK_RETURN: pin only when the trimmed label is non-empty.
+                    let ready = app().edit.as_ref().map_or(false, |e| {
+                        !String::from_utf16_lossy(&e.label).trim().is_empty()
+                    });
+                    if ready {
+                        end_edit(true);
+                    }
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_CHAR => {
+            if app().edit.is_none() {
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            match wp as u16 {
+                0x08 => {
+                    // Backspace: drop the last code unit (plus its surrogate pair).
+                    let mut a = app();
+                    if let Some(e) = a.edit.as_mut() {
+                        if let Some(last) = e.label.pop() {
+                            if (0xDC00..=0xDFFF).contains(&last) {
+                                if matches!(e.label.last(), Some(&p) if (0xD800..=0xDBFF).contains(&p)) {
+                                    e.label.pop();
+                                }
+                            }
+                        }
+                    }
+                    a.caret_on = true;
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                0x1B | 0x0D | 0x09 => {} // Esc/Enter handled in WM_KEYDOWN; ignore Tab
+                c if c < 0x20 => {}      // ignore other control chars
+                c => {
+                    let mut a = app();
+                    if let Some(e) = a.edit.as_mut() {
+                        if e.label.len() < 200 {
+                            e.label.push(c);
+                        }
+                    }
+                    a.caret_on = true;
+                    InvalidateRect(hwnd, null(), 0);
+                }
             }
             0
         }
@@ -1186,27 +1243,9 @@ unsafe fn cleanup(hwnd: HWND) {
     for p in a.pins.iter_mut() {
         scrub_string(&mut p.secret);
     }
-}
-
-fn register_class(
-    hinst: windows_sys::Win32::Foundation::HINSTANCE,
-    name: &[u16],
-    wndproc_fn: WNDPROC,
-    hbr: windows_sys::Win32::Graphics::Gdi::HBRUSH,
-) {
-    let wc = WNDCLASSW {
-        style: 0,
-        lpfnWndProc: wndproc_fn,
-        cbClsExtra: 0,
-        cbWndExtra: 0,
-        hInstance: hinst,
-        hIcon: null_mut(),
-        hCursor: unsafe { LoadCursorW(null_mut(), IDC_ARROW) },
-        hbrBackground: hbr,
-        lpszMenuName: null(),
-        lpszClassName: name.as_ptr(),
-    };
-    unsafe { RegisterClassW(&wc) };
+    if let Some(mut ed) = a.edit.take() {
+        scrub_string(&mut ed.secret);
+    }
 }
 
 fn main() {
@@ -1215,11 +1254,10 @@ fn main() {
         let hinst = GetModuleHandleW(null());
 
         let class_name = wide("ClipStackWnd");
-        let dlg_class = wide("ClipStackInput");
-        // Popup class: no background brush, we paint it ourselves.
+        // Popup class: drop shadow, and no background brush (we paint it ourselves).
         {
             let wc = WNDCLASSW {
-                style: 0,
+                style: CS_DROPSHADOW,
                 lpfnWndProc: Some(wndproc),
                 cbClsExtra: 0,
                 cbWndExtra: 0,
@@ -1232,8 +1270,6 @@ fn main() {
             };
             RegisterClassW(&wc);
         }
-        let dlg_bg = CreateSolidBrush(rgb(240, 240, 240));
-        register_class(hinst, &dlg_class, Some(dlg_proc), dlg_bg);
 
         let clipboard = arboard::Clipboard::new().ok();
         let pins = load_pins();
@@ -1241,7 +1277,6 @@ fn main() {
         *G.0.borrow_mut() = Some(App {
             hwnd: null_mut(),
             hook: 0,
-            hinst,
             clipboard,
             history: Vec::new(),
             pins,
@@ -1251,7 +1286,8 @@ fn main() {
             target: null_mut(),
             paused: false,
             visible: false,
-            modal: false,
+            edit: None,
+            caret_on: false,
             swallow_mup: false,
             hovered: -1,
             tracking_leave: false,
