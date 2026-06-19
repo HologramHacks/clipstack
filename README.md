@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="ClipStack — clipboard manager for Windows" width="820">
+</p>
+
 # ClipStack
 
 A tiny clipboard-history popup for Windows. Middle-click anywhere, pick from your last 50 clips, and it pastes straight into whatever field you were typing in.
@@ -37,6 +41,12 @@ Everything runs single-threaded on one Win32 message loop. The low-level mouse h
 ## Why I built it
 
 I wanted a clipboard manager that was instant, stayed out of the way, and didn't ship my clipboard off to a cloud service — so I built one, in Rust. It's small, fast, and mine.
+
+## Security notes
+
+- Clipboard **history lives only in memory** — it is never written to disk, and it is wiped on exit.
+- **Pinned secrets** are encrypted at rest with Windows DPAPI (per-user) in `%APPDATA%\ClipStack\pins.dat`. That protects them on disk, but note the limits: any program running as the *same Windows user* can ask DPAPI to decrypt them, and when you paste a pin it lands on the normal Windows clipboard in cleartext (that's the whole point). So treat it as "encrypted at rest, per user," not "hidden from everything."
+- **No network, no telemetry, no analytics.** ClipStack never opens a network connection.
 
 ## License
 

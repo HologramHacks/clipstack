@@ -957,7 +957,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER => {
             if wp == TIMER_CLIP {
-                poll_clip(app());
+                // Don't ingest new clips while a popup or modal dialog is open —
+                // it would shift the history indices the on-screen rows point at.
+                let a = app();
+                if !a.visible && !a.modal {
+                    poll_clip(a);
+                }
             }
             0
         }
@@ -1023,7 +1028,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             match kind {
                 Some(RowKind::Pin(j)) => {
                     let a = app();
-                    a.pins.remove(j);
+                    let mut p = a.pins.remove(j);
+                    scrub_string(&mut p.secret);
                     save_pins(a);
                     relayout(a);
                 }
@@ -1196,9 +1202,8 @@ fn main() {
         let dlg_bg = CreateSolidBrush(rgb(240, 240, 240));
         register_class(hinst, &dlg_class, Some(dlg_proc), dlg_bg);
 
-        let mut clipboard = arboard::Clipboard::new().ok();
+        let clipboard = arboard::Clipboard::new().ok();
         let pins = load_pins();
-        let _ = clipboard.as_mut();
 
         G = Some(App {
             hwnd: null_mut(),
