@@ -1,0 +1,40 @@
+# On a vX.Y.Z tag: build the release exe in CI, attach a SHA-256 checksum, and
+# attest build provenance (proves the binary was built from this source by this
+# workflow). This offsets the "unknown publisher" SmartScreen warning for
+# anyone who cares to verify, without a paid code-signing cert.
+#
+# Additive: a release created by hand still works if this fails — it just adds
+# the checksum + provenance and replaces the exe with the reproducible CI build.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # upload assets to the release
+  id-token: write # provenance attestation
+  attestations: write
+
+jobs:
+  release:
+    name: Build, checksum & attest
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (release)
+        run: cargo build --release --verbose
+      - name: SHA-256 checksum
+        shell: bash
+        run: cd target/release && sha256sum clipstack.exe | tee clipstack.exe.sha256
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: target/release/clipstack.exe
+      - name: Attach assets to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/clipstack.exe
+            target/release/clipstack.exe.sha256
