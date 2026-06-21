@@ -40,7 +40,10 @@ use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
 };
 use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+use windows_sys::Win32::System::Registry::{
+    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
+};
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -72,6 +75,11 @@ const WM_APP_CAPTURED: u32 = WM_APP + 5; // wparam=encoded trigger (0=cancel)
 const ID_PAUSE: usize = 101;
 const ID_CLEAR: usize = 102;
 const ID_QUIT: usize = 103;
+const ID_STARTUP: usize = 104;
+
+// HKCU Run-key entry for the optional "launch at startup" toggle.
+const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const RUN_VALUE: &str = "ClipStack";
 
 // Trigger submenu command ids (kept contiguous for CheckMenuRadioItem).
 const ID_TRIG_MIDDLE: usize = 201;
@@ -710,6 +718,92 @@ fn load_trigger() -> Trigger {
         }
     }
     Trigger::MIDDLE
+}
+
+// ---- Launch at startup (opt-in HKCU Run key) ------------------------------
+
+/// Full path to our own exe as a NUL-terminated wide string, or None if it
+/// can't be determined or is too long for the buffer — so we never write a
+/// truncated/garbage Run-key value.
+fn exe_path_w() -> Option<Vec<u16>> {
+    let mut buf = [0u16; 600];
+    let n = unsafe { GetModuleFileNameW(null_mut(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return None; // failed, or truncated (not NUL-terminated)
+    }
+    let mut v = buf[..n].to_vec();
+    v.push(0);
+    Some(v)
+}
+
+/// The exact REG_SZ string we register: the quoted full exe path (no NUL).
+fn run_value_w() -> Option<Vec<u16>> {
+    let path = exe_path_w()?;
+    let mut v = Vec::with_capacity(path.len() + 1);
+    v.push(b'"' as u16);
+    v.extend_from_slice(&path[..path.len() - 1]); // drop the NUL
+    v.push(b'"' as u16);
+    Some(v)
+}
+
+/// The current Run-key value (NUL-trimmed), if present.
+fn read_run_value() -> Option<Vec<u16>> {
+    let subkey = wide(RUN_SUBKEY);
+    let name = wide(RUN_VALUE);
+    unsafe {
+        let mut size: u32 = 0;
+        let q = |data: *mut c_void, size: *mut u32| {
+            RegGetValueW(HKEY_CURRENT_USER, subkey.as_ptr(), name.as_ptr(), RRF_RT_REG_SZ, null_mut(), data, size)
+        };
+        if q(null_mut(), &mut size) != 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; (size as usize / 2) + 1];
+        let mut size2 = (buf.len() * 2) as u32;
+        if q(buf.as_mut_ptr() as *mut c_void, &mut size2) != 0 {
+            return None;
+        }
+        let mut len = (size2 as usize / 2).min(buf.len());
+        while len > 0 && buf[len - 1] == 0 {
+            len -= 1;
+        }
+        buf.truncate(len);
+        Some(buf)
+    }
+}
+
+/// True only if the Run key exists AND points at *this* exe, so the checkbox
+/// stays honest if this portable exe gets moved or renamed.
+fn startup_enabled() -> bool {
+    match (read_run_value(), run_value_w()) {
+        (Some(stored), Some(expected)) => stored == expected,
+        _ => false,
+    }
+}
+
+/// Add or remove the Run-key entry. Only ever called from the tray toggle —
+/// never set automatically, so we don't surprise users or trip AV heuristics.
+fn set_startup(on: bool) {
+    let subkey = wide(RUN_SUBKEY);
+    let name = wide(RUN_VALUE);
+    unsafe {
+        if on {
+            if let Some(val) = run_value_w() {
+                let mut data = val;
+                data.push(0); // NUL-terminate for REG_SZ
+                RegSetKeyValueW(
+                    HKEY_CURRENT_USER,
+                    subkey.as_ptr(),
+                    name.as_ptr(),
+                    REG_SZ,
+                    data.as_ptr() as *const c_void,
+                    (data.len() * 2) as u32,
+                );
+            }
+        } else {
+            RegDeleteKeyValueW(HKEY_CURRENT_USER, subkey.as_ptr(), name.as_ptr());
+        }
+    }
 }
 
 // ---- Layout & paint -------------------------------------------------------
@@ -1720,6 +1814,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_QUIT => {
                     DestroyWindow(hwnd);
                 }
+                ID_STARTUP => set_startup(!startup_enabled()),
                 ID_TRIG_MIDDLE => set_trigger(Trigger::MIDDLE),
                 ID_TRIG_MOUSE4 => set_trigger(Trigger::MOUSE4),
                 ID_TRIG_MOUSE5 => set_trigger(Trigger::MOUSE5),
@@ -1768,6 +1863,11 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         MF_BYCOMMAND,
     );
     AppendMenuW(menu, MF_POPUP, sub as usize, wide("Trigger").as_ptr());
+    let mut startup_flags = MF_STRING;
+    if startup_enabled() {
+        startup_flags |= MF_CHECKED;
+    }
+    AppendMenuW(menu, startup_flags, ID_STARTUP, wide("Launch at startup").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
 
     let pause_label = if paused { wide("Resume capture") } else { wide("Pause capture") };
