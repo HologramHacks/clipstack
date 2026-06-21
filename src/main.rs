@@ -69,6 +69,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const MAX_HISTORY: usize = 50;
+const MAX_PINS: usize = 8; // keep the pin list short so the popup stays usable
 const VISIBLE: usize = 15;
 const SCROLL_STEP: usize = 3;
 
@@ -2028,30 +2029,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 Some(RowKind::Hist(i)) => {
                     // Begin inline labeling: the row turns into a text field.
-                    // Only text clips can be pinned (an image isn't a password).
-                    let hwnd2 = {
+                    // Only text clips can be pinned (an image isn't a password),
+                    // and only up to MAX_PINS so the popup stays usable.
+                    let (start, capped) = {
                         let mut a = app();
-                        let secret = match &a.history[i] {
-                            Clip::Text(s) => Some(s.clone()),
-                            Clip::Image(_) => None,
-                        };
-                        match secret {
-                            Some(secret) => {
-                                let restore = a.target;
-                                a.edit = Some(Edit { hist: i, secret, label: Vec::new(), restore });
-                                a.caret_on = true;
-                                Some(a.hwnd)
-                            }
-                            None => None,
+                        if !matches!(a.history.get(i), Some(Clip::Text(_))) {
+                            (None, false) // image (or gone) — can't pin
+                        } else if a.pins.len() >= MAX_PINS {
+                            (None, true) // at the limit — hint instead of editing
+                        } else {
+                            let secret = match a.history.get(i) {
+                                Some(Clip::Text(s)) => s.clone(),
+                                _ => unreachable!(),
+                            };
+                            let restore = a.target;
+                            a.edit = Some(Edit { hist: i, secret, label: Vec::new(), restore });
+                            a.caret_on = true;
+                            (Some(a.hwnd), false)
                         }
                     };
-                    if let Some(hwnd2) = hwnd2 {
+                    if let Some(hwnd2) = start {
                         // Briefly drop WS_EX_NOACTIVATE and take keyboard focus so
                         // the popup receives WM_CHAR. end_edit/hide_popup restore it.
                         set_no_activate(hwnd2, false);
                         SetForegroundWindow(hwnd2);
                         SetFocus(hwnd2);
                         InvalidateRect(hwnd2, null(), 1);
+                    } else if capped {
+                        let text =
+                            wide(&format!("Pin limit reached ({MAX_PINS}). Unpin one first."));
+                        let title = wide("ClipStack");
+                        MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
                     }
                 }
                 _ => {}

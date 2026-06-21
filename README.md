@@ -16,9 +16,11 @@ Written in Rust — raw Win32, no UI framework, single file, **zero third-party 
 
 ## Download & run (no Rust needed)
 
-Grab the latest `clipstack.exe` from the [**Releases**](https://github.com/HologramHacks/clipstack/releases/latest) page and run it. That's it — no installer, no runtime, no dependencies. It's a single ~0.5 MB file that lives in your system tray.
+Grab the latest `clipstack.exe` from the [**Releases**](https://github.com/HologramHacks/clipstack/releases/latest) page and run it. That's it — no installer, no runtime, no dependencies. It's a single ~0.25 MB file that lives in your system tray.
 
 First launch shows a Windows SmartScreen warning (it's unsigned) — click **More info → Run anyway**.
+
+> **Verify the download (optional):** every release ships a SHA-256 checksum (`clipstack.exe.sha256`) and a build-provenance attestation — proof the binary was built from this source by CI. With the [GitHub CLI](https://cli.github.com/): `gh attestation verify clipstack.exe --repo HologramHacks/clipstack`.
 
 ## Using it
 
@@ -30,7 +32,7 @@ ClipStack sits in your system tray. Middle-click is the default opener (you can 
 | **Mouse wheel** (popup open) | Scrolls through older clips |
 | **Left-click** a row | Copies that clip *and* pastes it into the field you were in |
 | **Click the ✕** on a row | Removes that clip from history |
-| **Right-click** a clip | Pins it with a label (kept until you remove it) |
+| **Right-click** a clip | Pins it with a label (kept until you remove it — up to 8 pins) |
 | **Right-click** a pin | Unpins it |
 | **Right-click the tray icon** | Choose the trigger · Launch at startup · Remember history · Pause capture · Clear history · Quit |
 
@@ -54,7 +56,7 @@ By default your history is **memory-only** — it vanishes when ClipStack closes
 - The popup opens right at your cursor and **never steals focus** from what you're doing
 - **Pinned secrets** are masked on screen, **encrypted in memory**, and DPAPI-encrypted on disk — decrypted only for the instant you paste them
 - **No cloud, no network** — your clipboard never leaves your machine
-- **Tiny** — a single ~0.5 MB exe, no runtime, no dependencies
+- **Tiny** — a single ~0.25 MB exe, no runtime, no dependencies
 
 ## Build from source
 
