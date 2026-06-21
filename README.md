@@ -50,7 +50,7 @@ By default your history is **memory-only** — it vanishes when ClipStack closes
 
 - Keeps your last **50 clips** — text *and* images
 - The popup opens right at your cursor and **never steals focus** from what you're doing
-- **Pinned secrets** are masked on screen and stored DPAPI-encrypted on disk — passwords/tokens never sit in plaintext
+- **Pinned secrets** are masked on screen, **encrypted in memory**, and DPAPI-encrypted on disk — decrypted only for the instant you paste them
 - **No cloud, no network** — your clipboard never leaves your machine
 - **Tiny** — a single ~0.5 MB exe, no runtime, no dependencies
 
@@ -66,7 +66,7 @@ The binary lands at `target/release/clipstack.exe`. Run it; it lives in the tray
 
 ## How it works (the short version)
 
-Everything runs single-threaded on one Win32 message loop. The low-level mouse hook and the window procedure both run on that one thread, so the global state is only ever touched there — borrows are scoped so the `&mut` is never held across a call that pumps messages (menus, dialogs). Clips are deduped by hash; pinned secrets go through `CryptProtectData` (DPAPI).
+Everything runs single-threaded on one Win32 message loop. The low-level mouse hook and the window procedure both run on that one thread, so the global state is only ever touched there — borrows are scoped so the `&mut` is never held across a call that pumps messages (menus, dialogs). Clips are deduped by hash. Pinned secrets are held encrypted in RAM with `CryptProtectMemory` (pages `VirtualLock`'d out of the pagefile) and DPAPI-encrypted (`CryptProtectData`) on disk.
 
 ## Why I built it
 
@@ -75,7 +75,7 @@ I wanted a clipboard manager that was instant, stayed out of the way, and didn't
 ## Security notes
 
 - Clipboard **history lives only in memory by default** — never written to disk, wiped on exit. (The opt-in **Remember history** setting changes this: while it's on, text clips are saved DPAPI-encrypted to `%APPDATA%\ClipStack\history.dat` until you clear them. It's off unless you turn it on.)
-- **Pinned secrets** are encrypted at rest with Windows DPAPI (per-user) in `%APPDATA%\ClipStack\pins.dat`. That protects them on disk, but note the limits: any program running as the *same Windows user* can ask DPAPI to decrypt them, and when you paste a pin it lands on the normal Windows clipboard in cleartext (that's the whole point). So treat it as "encrypted at rest, per user," not "hidden from everything."
+- **Pinned secrets are encrypted in memory *and* at rest.** In RAM they're held encrypted with `CryptProtectMemory` (per-process key) and their pages are locked out of the pagefile (`VirtualLock`); they're decrypted only for the instant you paste them, then the plaintext is wiped. On disk they're DPAPI-encrypted (per-user) in `%APPDATA%\ClipStack\pins.dat`. Honest limits: a program running as the *same Windows user* can still ask DPAPI to decrypt the file, and pasting a pin necessarily lands it on the Windows clipboard in cleartext (that's the point of pasting). So: encrypted in memory, encrypted at rest, decrypted only at the moment of use — not hidden from everything.
 - ClipStack uses a **global mouse hook** (to catch your open shortcut) and **reads the clipboard on a short timer** (that's how history is built) — the same behaviors some malware uses, so an unsigned build may trip a SmartScreen or antivirus warning. It's all local: no keystroke logging, nothing leaves your machine, and the full source is right here to check.
 - Your trigger choice is saved in plaintext at `%APPDATA%\ClipStack\settings.txt` — it's just a key/button name, not a secret.
 - **No network, no telemetry, no analytics.** ClipStack never opens a network connection.

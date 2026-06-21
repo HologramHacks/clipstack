@@ -38,8 +38,10 @@ use windows_sys::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::Security::Cryptography::{
-    CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
+    CryptProtectData, CryptProtectMemory, CryptUnprotectData, CryptUnprotectMemory,
+    CRYPTPROTECTMEMORY_SAME_PROCESS, CRYPT_INTEGER_BLOB,
 };
+use windows_sys::Win32::System::Memory::{VirtualLock, VirtualUnlock};
 use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Registry::{
@@ -127,7 +129,8 @@ enum Clip {
 
 struct Pin {
     label: String,
-    secret: String,
+    secret_enc: Vec<u8>, // CryptProtectMemory-encrypted in RAM, pages VirtualLock'd
+    len: usize,          // original plaintext byte length (the rest is padding)
 }
 
 /// In-progress inline pin labeling. While this is `Some`, the right-clicked
@@ -602,6 +605,57 @@ fn dpapi_unprotect(enc: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+// ---- Pinned-secret in-memory protection -----------------------------------
+// A pinned secret is never held as plaintext in RAM. It's encrypted with
+// CryptProtectMemory (per-process key) and the pages are VirtualLock'd out of
+// the pagefile; it's decrypted only for the instant it's pasted or re-saved.
+
+const MEM_BLOCK: usize = 16; // CRYPTPROTECTMEMORY_BLOCK_SIZE
+
+/// Encrypt a secret in RAM. Returns the padded ciphertext (a multiple of 16)
+/// and the original byte length.
+fn protect_secret(plain: &str) -> (Vec<u8>, usize) {
+    let len = plain.len();
+    let padded = ((len + MEM_BLOCK - 1) / MEM_BLOCK).max(1) * MEM_BLOCK;
+    let mut buf = vec![0u8; padded];
+    buf[..len].copy_from_slice(plain.as_bytes());
+    unsafe {
+        CryptProtectMemory(
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32,
+            CRYPTPROTECTMEMORY_SAME_PROCESS,
+        );
+        VirtualLock(buf.as_mut_ptr() as *mut c_void, buf.len()); // best-effort: keep out of pagefile
+    }
+    (buf, len)
+}
+
+/// Decrypt a protected secret into a String for transient use. The caller MUST
+/// scrub the returned String as soon as it's done with it.
+fn unprotect_secret(enc: &[u8], len: usize) -> String {
+    let mut buf = enc.to_vec();
+    unsafe {
+        CryptUnprotectMemory(
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32,
+            CRYPTPROTECTMEMORY_SAME_PROCESS,
+        );
+    }
+    let s = String::from_utf8_lossy(&buf[..len.min(buf.len())]).into_owned();
+    buf.iter_mut().for_each(|b| *b = 0); // wipe the transient plaintext
+    s
+}
+
+/// Zero + unlock a pin's encrypted secret buffer (on delete/unpin/exit).
+fn scrub_pin(p: &mut Pin) {
+    if !p.secret_enc.is_empty() {
+        unsafe { VirtualUnlock(p.secret_enc.as_mut_ptr() as *mut c_void, p.secret_enc.len()) };
+        p.secret_enc.iter_mut().for_each(|b| *b = 0);
+    }
+    p.secret_enc.clear();
+    p.len = 0;
+}
+
 fn escape(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('\n', "\\n")
@@ -659,25 +713,29 @@ fn read_encrypted(path: std::path::PathBuf) -> Option<String> {
 fn save_pins(a: &App) {
     let mut s = String::new();
     for p in &a.pins {
+        let mut secret = unprotect_secret(&p.secret_enc, p.len);
         s.push_str(&escape(&p.label));
         s.push('\t');
-        s.push_str(&escape(&p.secret));
+        s.push_str(&escape(&secret));
         s.push('\n');
+        scrub_string(&mut secret);
     }
     write_encrypted(appdata_file("pins.dat"), &s);
+    scrub_string(&mut s); // s briefly held the plaintext secrets
 }
 
 fn load_pins() -> Vec<Pin> {
     let mut pins = Vec::new();
-    if let Some(text) = read_encrypted(appdata_file("pins.dat")) {
+    if let Some(mut text) = read_encrypted(appdata_file("pins.dat")) {
         for line in text.lines() {
             if let Some((l, sec)) = line.split_once('\t') {
-                pins.push(Pin {
-                    label: unescape(l),
-                    secret: unescape(sec),
-                });
+                let mut secret = unescape(sec);
+                let (secret_enc, len) = protect_secret(&secret);
+                scrub_string(&mut secret);
+                pins.push(Pin { label: unescape(l), secret_enc, len });
             }
         }
+        scrub_string(&mut text); // the decrypted file held plaintext secrets
     }
     pins
 }
@@ -1249,7 +1307,7 @@ fn delete_row(a: &mut App, idx: usize) {
         }
         RowKind::Pin(j) => {
             let mut p = a.pins.remove(j);
-            scrub_string(&mut p.secret);
+            scrub_pin(&mut p);
             save_pins(a);
         }
         RowKind::Sep => {}
@@ -1268,8 +1326,9 @@ fn commit_row(a: &mut App, idx: usize) -> HWND {
             a.target
         }
         RowKind::Pin(j) => {
-            let s = a.pins[j].secret.clone();
-            set_clipboard(a, &Clip::Text(s));
+            let mut s = unprotect_secret(&a.pins[j].secret_enc, a.pins[j].len);
+            set_clipboard(a, &Clip::Text(s.clone()));
+            scrub_string(&mut s); // wipe our transient plaintext (OS clipboard copy is inherent)
             hide_popup(a);
             a.target
         }
@@ -1320,8 +1379,10 @@ unsafe fn end_edit(commit: bool) {
         if commit {
             let label = String::from_utf16_lossy(&ed.label).trim().to_string();
             if !label.is_empty() {
-                let secret = std::mem::take(&mut ed.secret);
-                a.pins.push(Pin { label, secret });
+                let mut secret = std::mem::take(&mut ed.secret);
+                let (secret_enc, len) = protect_secret(&secret);
+                scrub_string(&mut secret);
+                a.pins.push(Pin { label, secret_enc, len });
                 save_pins(&*a);
             }
         }
@@ -1756,7 +1817,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Some(RowKind::Pin(j)) => {
                     let mut a = app();
                     let mut p = a.pins.remove(j);
-                    scrub_string(&mut p.secret);
+                    scrub_pin(&mut p);
                     save_pins(&*a);
                     relayout(&mut *a);
                 }
@@ -2051,7 +2112,7 @@ unsafe fn cleanup(hwnd: HWND) {
     a.history.iter_mut().for_each(scrub_clip);
     a.history.clear();
     for p in a.pins.iter_mut() {
-        scrub_string(&mut p.secret);
+        scrub_pin(p);
     }
     if let Some(mut ed) = a.edit.take() {
         scrub_string(&mut ed.secret);
