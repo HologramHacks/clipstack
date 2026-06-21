@@ -31,10 +31,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
-    EndPaint, FillRect, FrameRect, GetTextExtentPoint32W, InvalidateRect, SelectObject, SetBkMode,
-    SetTextColor, SetWindowRgn, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
-    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, FW_NORMAL, HDC, HFONT, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    EndPaint, FillRect, FrameRect, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
+    MonitorFromPoint, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER,
+    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC, HFONT, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
@@ -46,7 +47,8 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::{
-    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    MDT_EFFECTIVE_DPI,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyNameTextW, MapVirtualKeyW, RegisterHotKey, SendInput, SetFocus,
@@ -916,7 +918,7 @@ fn show_popup(a: &mut App, cx: i32, cy: i32) {
     if a.history.is_empty() && a.pins.is_empty() {
         return;
     }
-    let dpi = unsafe { GetDpiForWindow(a.hwnd) };
+    let dpi = unsafe { dpi_for_point(cx, cy) };
     let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
     a.item_h = (34.0 * scale) as i32;
     a.sep_h = (12.0 * scale) as i32;
@@ -944,12 +946,28 @@ unsafe fn round_window(hwnd: HWND, w: i32, h: i32) {
     SetWindowRgn(hwnd, rgn, 1);
 }
 
+/// Effective DPI of the monitor under a screen point. We read the *target*
+/// monitor (where the popup is about to open) rather than GetDpiForWindow,
+/// which would report the monitor the window currently sits on — so the very
+/// first open on a differently-scaled screen uses the correct scale.
+unsafe fn dpi_for_point(cx: i32, cy: i32) -> u32 {
+    let hmon = MonitorFromPoint(POINT { x: cx, y: cy }, MONITOR_DEFAULTTONEAREST);
+    let (mut dx, mut dy) = (96u32, 96u32);
+    GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+    dx
+}
+
 /// Clamp `(cx, cy)` + the window size into the work area, move the window
 /// there, round it, and show it. Shared by the history popup and the capture
 /// prompt so the placement math lives in exactly one place.
 unsafe fn place_and_show(a: &mut App, cx: i32, cy: i32, height: i32) {
-    let mut wa: RECT = std::mem::zeroed();
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut _ as _, 0);
+    // Use the work area of the monitor *under the cursor*, not the primary one
+    // (SPI_GETWORKAREA is primary-only), so the popup lands on the right screen.
+    let mut mi: MONITORINFO = std::mem::zeroed();
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    let hmon = MonitorFromPoint(POINT { x: cx, y: cy }, MONITOR_DEFAULTTONEAREST);
+    GetMonitorInfoW(hmon, &mut mi);
+    let wa = mi.rcWork;
     let xx = cx.min(wa.right - a.width).max(wa.left);
     let yy = cy.min(wa.bottom - height).max(wa.top);
     a.popup_x = xx;
@@ -983,7 +1001,7 @@ unsafe fn make_font(scale: f32) -> HFONT {
 
 /// Show the single-row "press a trigger" prompt near the cursor.
 fn show_capture_prompt(a: &mut App, cx: i32, cy: i32) {
-    let dpi = unsafe { GetDpiForWindow(a.hwnd) };
+    let dpi = unsafe { dpi_for_point(cx, cy) };
     let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
     a.item_h = (34.0 * scale) as i32;
     a.pad = (6.0 * scale) as i32;
