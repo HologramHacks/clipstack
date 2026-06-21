@@ -14,7 +14,7 @@
 // global `App` is only ever touched there. We take a `&mut App` for one handler
 // and never hold it across a Win32 call that pumps messages (TrackPopupMenu,
 // SetForegroundWindow) — borrows are scoped accordingly.
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 #![allow(non_snake_case)]
 
 use std::borrow::Cow;
@@ -27,7 +27,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    LocalFree, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    GlobalFree, LocalFree, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
@@ -151,7 +151,7 @@ struct Edit {
 }
 
 /// A non-typing mouse button usable as a trigger.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Btn {
     Middle,
     X1, // "back"
@@ -161,7 +161,7 @@ enum Btn {
 /// How the user opens the popup. Exactly one is active; persisted to
 /// settings.txt and applied live from the tray. Either a mouse button or a
 /// keyboard key, each with an optional modifier mask (`M_*`).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Trigger {
     Mouse { btn: Btn, mods: u8 },
     Key { vk: u32, mods: u8 },
@@ -594,6 +594,17 @@ unsafe fn global_from(bytes: &[u8]) -> *mut c_void {
     h
 }
 
+/// `SetClipboardData`, freeing the handle if the system didn't take ownership
+/// (a failed call leaves us owning it — free it so we don't leak).
+unsafe fn set_clip_data(fmt: u32, h: *mut c_void) {
+    if h.is_null() {
+        return;
+    }
+    if SetClipboardData(fmt, h).is_null() {
+        GlobalFree(h);
+    }
+}
+
 /// Put `s` on the clipboard AND tag it to be excluded from Windows clipboard
 /// history (Win+V) and cloud sync — for pasting a pinned secret, the way
 /// password managers do. Raw Win32 because arboard doesn't expose these formats.
@@ -605,7 +616,7 @@ unsafe fn set_clipboard_secret(hwnd: HWND, s: &str) {
     // The text itself (UTF-16, NUL-terminated).
     let text: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
     let bytes = std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len() * 2);
-    SetClipboardData(CF_UNICODETEXT, global_from(bytes));
+    set_clip_data(CF_UNICODETEXT, global_from(bytes));
     // Exclusion tags (each a DWORD 0): keep it out of Win+V and the cloud.
     let zero = 0u32.to_ne_bytes();
     for name in [
@@ -615,7 +626,7 @@ unsafe fn set_clipboard_secret(hwnd: HWND, s: &str) {
     ] {
         let fmt = RegisterClipboardFormatW(wide(name).as_ptr());
         if fmt != 0 {
-            SetClipboardData(fmt, global_from(&zero));
+            set_clip_data(fmt, global_from(&zero));
         }
     }
     CloseClipboard();
@@ -1130,6 +1141,18 @@ fn relayout(a: &mut App) {
     a.hovered = -1;
 }
 
+/// Toggle `WS_EX_NOACTIVATE`. Off lets the popup take keyboard focus (for inline
+/// label editing / trigger capture); on restores click-through behavior.
+unsafe fn set_no_activate(hwnd: HWND, on: bool) {
+    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    let ex = if on {
+        ex | WS_EX_NOACTIVATE as isize
+    } else {
+        ex & !(WS_EX_NOACTIVATE as isize)
+    };
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+}
+
 fn hide_popup(a: &mut App) {
     // Abandon any in-progress label edit (scrub the secret, restore the
     // no-activate style we dropped to take focus). Foreground naturally moves
@@ -1137,8 +1160,7 @@ fn hide_popup(a: &mut App) {
     if let Some(mut ed) = a.edit.take() {
         scrub_string(&mut ed.secret);
         unsafe {
-            let ex = GetWindowLongPtrW(a.hwnd, GWL_EXSTYLE);
-            SetWindowLongPtrW(a.hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE as isize);
+            set_no_activate(a.hwnd, true);
         }
     }
     a.caret_on = false;
@@ -1446,8 +1468,7 @@ unsafe fn end_edit(commit: bool) {
     };
     // Restore the no-activate style we dropped to grab focus, then hand the
     // keyboard back to wherever the user was typing before.
-    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE as isize);
+    set_no_activate(hwnd, true);
     if !restore.is_null() {
         SetForegroundWindow(restore);
     }
@@ -1587,8 +1608,7 @@ unsafe fn start_capture() {
         GetCursorPos(&mut pt);
         (a.hwnd, pt.x, pt.y)
     };
-    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !(WS_EX_NOACTIVATE as isize));
+    set_no_activate(hwnd, false);
     show_capture_prompt(&mut app(), x, y);
     SetForegroundWindow(hwnd);
     SetFocus(hwnd);
@@ -1603,8 +1623,7 @@ unsafe fn finish_capture(new: Option<Trigger>) {
         }
         a.capturing = false;
         a.caret_on = false;
-        let ex = GetWindowLongPtrW(a.hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(a.hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE as isize);
+        set_no_activate(a.hwnd, true);
         a.visible = false;
         ShowWindow(a.hwnd, SW_HIDE);
         let prev = a.trigger;
@@ -1896,8 +1915,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if let Some(hwnd2) = hwnd2 {
                         // Briefly drop WS_EX_NOACTIVATE and take keyboard focus so
                         // the popup receives WM_CHAR. end_edit/hide_popup restore it.
-                        let ex = GetWindowLongPtrW(hwnd2, GWL_EXSTYLE);
-                        SetWindowLongPtrW(hwnd2, GWL_EXSTYLE, ex & !(WS_EX_NOACTIVATE as isize));
+                        set_no_activate(hwnd2, false);
                         SetForegroundWindow(hwnd2);
                         SetFocus(hwnd2);
                         InvalidateRect(hwnd2, null(), 1);
@@ -1910,12 +1928,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             if app().capturing {
                 let vk = wp as u32;
+                // Apply via the same WM_APP_CAPTURED channel the mouse hook uses,
+                // so both capture paths funnel through one handler.
                 if vk == 0x1B {
-                    finish_capture(None); // Esc cancels
+                    PostMessageW(hwnd, WM_APP_CAPTURED, 0, 0); // Esc cancels
                 } else if !is_modifier_vk(vk) {
                     let mods = cur_mods();
                     if mods != 0 {
-                        finish_capture(Some(Trigger::Key { vk, mods }));
+                        let w = encode_trigger(Trigger::Key { vk, mods });
+                        PostMessageW(hwnd, WM_APP_CAPTURED, w, 0);
                     }
                     // bare key (no modifier) is rejected by the guardrail; wait
                 }
@@ -1926,6 +1947,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     0x1B => end_edit(false), // VK_ESCAPE: cancel
                     0x0D => {
                         // VK_RETURN: pin only when the trimmed label is non-empty.
+                        // On empty-Enter we intentionally do nothing — keeping the
+                        // field open to keep typing — rather than calling end_edit
+                        // (which would close it). Don't "simplify" into end_edit(true).
                         let ready = app().edit.as_ref().is_some_and(|e| {
                             !String::from_utf16_lossy(&e.label).trim().is_empty()
                         });
@@ -2278,5 +2302,82 @@ fn main() {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_unescape_roundtrips() {
+        for s in [
+            "",
+            "plain text",
+            "line1\nline2\r\nline3",
+            "tab\there",
+            "back\\slash",
+            "mix\\\n\t\\\\end",
+            "trailing backslash\\",
+        ] {
+            assert_eq!(unescape(&escape(s)), s, "round-trip failed for {s:?}");
+        }
+    }
+
+    #[test]
+    fn escape_emits_no_raw_control_chars() {
+        let e = escape("a\nb\tc\rd");
+        assert!(!e.contains('\n') && !e.contains('\t') && !e.contains('\r'));
+    }
+
+    #[test]
+    fn mods_token_parse_roundtrips() {
+        for m in [
+            0,
+            M_CTRL,
+            M_SHIFT,
+            M_ALT,
+            M_WIN,
+            M_CTRL | M_SHIFT,
+            M_CTRL | M_ALT | M_WIN,
+            M_CTRL | M_SHIFT | M_ALT | M_WIN,
+        ] {
+            assert_eq!(parse_mods(&mods_token(m)), m);
+        }
+    }
+
+    #[test]
+    fn parse_mods_ignores_unknown_chars() {
+        assert_eq!(parse_mods("CXSqA"), M_CTRL | M_SHIFT | M_ALT);
+    }
+
+    #[test]
+    fn make_preview_collapses_whitespace_and_trims() {
+        assert_eq!(make_preview("a\n\n\nb"), wide_no_nul("a b"));
+        assert_eq!(make_preview("  hello   world  "), wide_no_nul("hello world"));
+        assert_eq!(make_preview("tab\tsep"), wide_no_nul("tab sep"));
+    }
+
+    #[test]
+    fn make_preview_caps_length() {
+        assert!(make_preview(&"x".repeat(500)).len() <= 160);
+    }
+
+    #[test]
+    fn trigger_encode_decode_roundtrips() {
+        for t in [
+            Trigger::Mouse { btn: Btn::Middle, mods: 0 },
+            Trigger::Mouse { btn: Btn::X1, mods: M_CTRL },
+            Trigger::Mouse { btn: Btn::X2, mods: M_CTRL | M_SHIFT },
+            Trigger::Key { vk: 0x56, mods: M_ALT },
+            Trigger::Key { vk: 0x74, mods: M_CTRL | M_WIN },
+        ] {
+            assert_eq!(decode_trigger(encode_trigger(t)), Some(t));
+        }
+    }
+
+    #[test]
+    fn decode_trigger_zero_is_none() {
+        assert!(decode_trigger(0).is_none());
     }
 }
