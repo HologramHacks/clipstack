@@ -33,7 +33,7 @@ jobs:
         with:
           subject-path: target/release/clipstack.exe
       - name: Attach assets to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             target/release/clipstack.exe
