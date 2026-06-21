@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Rust dependencies — weekly security/version PRs.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  # Keep the CI workflow's actions up to date too.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

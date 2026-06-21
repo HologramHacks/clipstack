@@ -616,7 +616,7 @@ const MEM_BLOCK: usize = 16; // CRYPTPROTECTMEMORY_BLOCK_SIZE
 /// and the original byte length.
 fn protect_secret(plain: &str) -> (Vec<u8>, usize) {
     let len = plain.len();
-    let padded = ((len + MEM_BLOCK - 1) / MEM_BLOCK).max(1) * MEM_BLOCK;
+    let padded = len.div_ceil(MEM_BLOCK).max(1) * MEM_BLOCK;
     let mut buf = vec![0u8; padded];
     buf[..len].copy_from_slice(plain.as_bytes());
     unsafe {
@@ -1183,7 +1183,7 @@ unsafe fn draw_thumb(hdc: HDC, ic: &ImageClip, x: i32, y: i32, maxh: i32) -> i32
     bmi.bmiHeader.biHeight = -ic.th; // top-down
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB as u32;
+    bmi.bmiHeader.biCompression = BI_RGB;
     StretchDIBits(
         hdc,
         x,
@@ -1243,8 +1243,8 @@ unsafe fn paint(hwnd: HWND) {
                 fill_color(hdc, text_left, mid, a.width - text_left, mid + 1, COL_SEP);
             }
             RowKind::Hist(i) => {
-                if a.edit.as_ref().map_or(false, |e| e.hist == i) {
-                    paint_edit_row(hdc, &*a, r, text_left);
+                if a.edit.as_ref().is_some_and(|e| e.hist == i) {
+                    paint_edit_row(hdc, &a, r, text_left);
                     continue;
                 }
                 if hovered {
@@ -1383,12 +1383,12 @@ unsafe fn end_edit(commit: bool) {
                 let (secret_enc, len) = protect_secret(&secret);
                 scrub_string(&mut secret);
                 a.pins.push(Pin { label, secret_enc, len });
-                save_pins(&*a);
+                save_pins(&a);
             }
         }
         scrub_string(&mut ed.secret); // no-op if the secret was moved into the pin
         a.caret_on = false;
-        relayout(&mut *a); // resize for the (possibly) new pin and repaint
+        relayout(&mut a); // resize for the (possibly) new pin and repaint
         (a.hwnd, ed.restore)
     };
     // Restore the no-activate style we dropped to grab focus, then hand the
@@ -1449,10 +1449,10 @@ unsafe fn set_trigger(t: Trigger) {
         }
         let prev = a.trigger;
         a.trigger = t;
-        reconcile_input(&mut *a);
+        reconcile_input(&mut a);
         if t.is_key() && !a.hotkey_active {
             a.trigger = prev;
-            reconcile_input(&mut *a);
+            reconcile_input(&mut a);
             (a.hwnd, prev.describe(), false)
         } else {
             (a.hwnd, t.describe(), true)
@@ -1529,7 +1529,7 @@ unsafe fn start_capture() {
         }
         a.target = GetForegroundWindow(); // focus to restore when done
         a.capturing = true;
-        reconcile_input(&mut *a);
+        reconcile_input(&mut a);
         let mut pt: POINT = std::mem::zeroed();
         GetCursorPos(&mut pt);
         (a.hwnd, pt.x, pt.y)
@@ -1558,14 +1558,14 @@ unsafe fn finish_capture(new: Option<Trigger>) {
         let mut failed = false;
         if let Some(t) = new {
             a.trigger = t;
-            reconcile_input(&mut *a);
+            reconcile_input(&mut a);
             if t.is_key() && !a.hotkey_active {
                 a.trigger = prev; // couldn't register the combo — keep the old one
-                reconcile_input(&mut *a);
+                reconcile_input(&mut a);
                 failed = true;
             }
         } else {
-            reconcile_input(&mut *a);
+            reconcile_input(&mut a);
         }
         (a.hwnd, a.target, a.trigger.describe(), failed)
     };
@@ -1709,7 +1709,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 _ => {}
             }
             a.hovered = -1;
-            rebuild_rows(&mut *a);
+            rebuild_rows(&mut a);
             InvalidateRect(hwnd, null(), 1);
             0
         }
@@ -1723,12 +1723,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 } else if !a.visible {
                     // Don't ingest new clips while the popup is open — it would
                     // shift the history indices the on-screen rows point at.
-                    poll_clip(&mut *a);
+                    poll_clip(&mut a);
                 }
                 // Flush history to disk if it changed and persistence is on. The
                 // ~0.5s cadence means a crash loses at most half a second.
                 if a.persist && a.history_dirty {
-                    save_history(&*a);
+                    save_history(&a);
                     a.history_dirty = false;
                 }
             }
@@ -1750,7 +1750,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 TrackMouseEvent(&mut tme);
                 a.tracking_leave = true;
             }
-            let row = row_at(&*a, y).map(|i| i as i32).unwrap_or(-1);
+            let row = row_at(&a, y).map(|i| i as i32).unwrap_or(-1);
             if row != a.hovered {
                 a.hovered = row;
                 InvalidateRect(hwnd, null(), 1);
@@ -1782,18 +1782,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let (x, y) = lo_hi(lp);
             let target = {
                 let mut a = app();
-                match row_at(&*a, y) {
+                match row_at(&a, y) {
                     Some(idx) if x >= a.width - a.item_h => {
                         // Clicked the ✕ delete affordance on the right edge.
-                        delete_row(&mut *a, idx);
+                        delete_row(&mut a, idx);
                         if a.history.is_empty() && a.pins.is_empty() {
-                            hide_popup(&mut *a);
+                            hide_popup(&mut a);
                         } else {
-                            relayout(&mut *a);
+                            relayout(&mut a);
                         }
                         null_mut()
                     }
-                    Some(idx) => commit_row(&mut *a, idx),
+                    Some(idx) => commit_row(&mut a, idx),
                     None => null_mut(),
                 }
             };
@@ -1811,15 +1811,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let (_x, y) = lo_hi(lp);
             let kind = {
                 let a = app();
-                row_at(&*a, y).map(|idx| a.rows[idx].kind)
+                row_at(&a, y).map(|idx| a.rows[idx].kind)
             };
             match kind {
                 Some(RowKind::Pin(j)) => {
                     let mut a = app();
                     let mut p = a.pins.remove(j);
                     scrub_pin(&mut p);
-                    save_pins(&*a);
-                    relayout(&mut *a);
+                    save_pins(&a);
+                    relayout(&mut a);
                 }
                 Some(RowKind::Hist(i)) => {
                     // Begin inline labeling: the row turns into a text field.
@@ -1873,7 +1873,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     0x1B => end_edit(false), // VK_ESCAPE: cancel
                     0x0D => {
                         // VK_RETURN: pin only when the trimmed label is non-empty.
-                        let ready = app().edit.as_ref().map_or(false, |e| {
+                        let ready = app().edit.as_ref().is_some_and(|e| {
                             !String::from_utf16_lossy(&e.label).trim().is_empty()
                         });
                         if ready {
@@ -1896,11 +1896,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let mut a = app();
                     if let Some(e) = a.edit.as_mut() {
                         if let Some(last) = e.label.pop() {
-                            if (0xDC00..=0xDFFF).contains(&last) {
-                                if matches!(e.label.last(), Some(&p) if (0xD800..=0xDBFF).contains(&p)) {
+                            if (0xDC00..=0xDFFF).contains(&last)
+                                && matches!(e.label.last(), Some(&p) if (0xD800..=0xDBFF).contains(&p)) {
                                     e.label.pop();
                                 }
-                            }
                         }
                     }
                     a.caret_on = true;
@@ -1931,7 +1930,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 a.target = GetForegroundWindow();
                 let mut pt: POINT = std::mem::zeroed();
                 GetCursorPos(&mut pt);
-                show_popup(&mut *a, pt.x, pt.y);
+                show_popup(&mut a, pt.x, pt.y);
             }
             0
         }
@@ -1947,14 +1946,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_COMMAND => {
-            match (wp & 0xffff) as usize {
+            match wp & 0xffff {
                 ID_PAUSE => {
                     let mut a = app();
                     a.paused = !a.paused;
                     if a.paused {
-                        hide_popup(&mut *a);
+                        hide_popup(&mut a);
                     }
-                    reconcile_input(&mut *a); // pause fully removes the hook/hotkey
+                    reconcile_input(&mut a); // pause fully removes the hook/hotkey
                 }
                 ID_CLEAR => {
                     let mut a = app();
@@ -1964,7 +1963,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if a.persist {
                         clear_history_file(); // wipe the persisted copy too
                     }
-                    hide_popup(&mut *a);
+                    hide_popup(&mut a);
                 }
                 ID_QUIT => {
                     DestroyWindow(hwnd);
@@ -1975,7 +1974,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     a.persist = !a.persist;
                     save_settings(a.trigger, a.persist);
                     if a.persist {
-                        save_history(&*a); // capture what's already in memory
+                        save_history(&a); // capture what's already in memory
                     } else {
                         clear_history_file(); // stop remembering: delete the file
                     }
@@ -2104,7 +2103,7 @@ unsafe fn cleanup(hwnd: HWND) {
     }
     // If the user opted in, persist the latest history before wiping memory.
     if a.persist && a.history_dirty {
-        save_history(&*a);
+        save_history(&a);
         a.history_dirty = false;
     }
     // Wipe in-memory secrets/clips on exit. By default history never touches
