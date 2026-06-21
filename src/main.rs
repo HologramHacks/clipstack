@@ -41,8 +41,13 @@ use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptProtectMemory, CryptUnprotectData, CryptUnprotectMemory,
     CRYPTPROTECTMEMORY_SAME_PROCESS, CRYPT_INTEGER_BLOB,
 };
-use windows_sys::Win32::System::Memory::{VirtualLock, VirtualUnlock};
-use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
+use windows_sys::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalUnlock, VirtualLock, VirtualUnlock, GMEM_MOVEABLE,
+};
+use windows_sys::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
+};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
@@ -571,6 +576,49 @@ fn set_clipboard(a: &mut App, clip: &Clip) {
     }
     // Don't re-ingest our own write on the next poll.
     a.last_seq = unsafe { GetClipboardSequenceNumber() };
+}
+
+const CF_UNICODETEXT: u32 = 13;
+
+/// Allocate a moveable HGLOBAL holding `bytes`, for SetClipboardData (which
+/// takes ownership of it on success).
+unsafe fn global_from(bytes: &[u8]) -> *mut c_void {
+    let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
+    if !h.is_null() {
+        let p = GlobalLock(h);
+        if !p.is_null() {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+            GlobalUnlock(h);
+        }
+    }
+    h
+}
+
+/// Put `s` on the clipboard AND tag it to be excluded from Windows clipboard
+/// history (Win+V) and cloud sync — for pasting a pinned secret, the way
+/// password managers do. Raw Win32 because arboard doesn't expose these formats.
+unsafe fn set_clipboard_secret(hwnd: HWND, s: &str) {
+    if OpenClipboard(hwnd) == 0 {
+        return;
+    }
+    EmptyClipboard();
+    // The text itself (UTF-16, NUL-terminated).
+    let text: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes = std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len() * 2);
+    SetClipboardData(CF_UNICODETEXT, global_from(bytes));
+    // Exclusion tags (each a DWORD 0): keep it out of Win+V and the cloud.
+    let zero = 0u32.to_ne_bytes();
+    for name in [
+        "CanIncludeInClipboardHistory",
+        "CanUploadToCloudClipboard",
+        "ExcludeClipboardContentFromMonitorProcessing",
+    ] {
+        let fmt = RegisterClipboardFormatW(wide(name).as_ptr());
+        if fmt != 0 {
+            SetClipboardData(fmt, global_from(&zero));
+        }
+    }
+    CloseClipboard();
 }
 
 // ---- Pin persistence (DPAPI) ----------------------------------------------
@@ -1329,8 +1377,11 @@ fn commit_row(a: &mut App, idx: usize) -> HWND {
         }
         RowKind::Pin(j) => {
             let mut s = unprotect_secret(&a.pins[j].secret_enc, a.pins[j].len);
-            set_clipboard(a, &Clip::Text(s.clone()));
-            scrub_string(&mut s); // wipe our transient plaintext (OS clipboard copy is inherent)
+            unsafe {
+                set_clipboard_secret(a.hwnd, &s); // excluded from Win+V history + cloud
+                a.last_seq = GetClipboardSequenceNumber(); // don't re-ingest our own write
+            }
+            scrub_string(&mut s); // wipe our transient plaintext (the live clipboard copy is inherent)
             hide_popup(a);
             a.target
         }
