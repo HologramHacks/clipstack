@@ -1,6 +1,6 @@
 [package]
 name = "clipstack"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Tiny clipboard history popup for Windows (configurable trigger)"
 
@@ -8,7 +8,7 @@ description = "Tiny clipboard history popup for Windows (configurable trigger)"
 arboard = "3"
 
 [dependencies.windows-sys]
-version = "0.61"
+version = "0.59"
 features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",

@@ -6,6 +6,12 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # windows-sys 0.60+ fails to build on the GNU toolchain we use (dlltool).
+      # Pin to 0.59.x; allow patch updates only.
+      - dependency-name: "windows-sys"
+        update-types:
+          ["version-update:semver-minor", "version-update:semver-major"]
   # Keep the CI workflow's actions up to date too.
   - package-ecosystem: github-actions
     directory: "/"
