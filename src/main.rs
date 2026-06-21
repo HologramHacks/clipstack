@@ -31,10 +31,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
-    EndPaint, FillRect, FrameRect, GetTextExtentPoint32W, InvalidateRect, SelectObject, SetBkMode,
-    SetTextColor, SetWindowRgn, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
-    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, FW_NORMAL, HDC, HFONT, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    EndPaint, FillRect, FrameRect, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
+    MonitorFromPoint, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER,
+    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC, HFONT, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
@@ -948,8 +949,13 @@ unsafe fn round_window(hwnd: HWND, w: i32, h: i32) {
 /// there, round it, and show it. Shared by the history popup and the capture
 /// prompt so the placement math lives in exactly one place.
 unsafe fn place_and_show(a: &mut App, cx: i32, cy: i32, height: i32) {
-    let mut wa: RECT = std::mem::zeroed();
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut _ as _, 0);
+    // Use the work area of the monitor *under the cursor*, not the primary one
+    // (SPI_GETWORKAREA is primary-only), so the popup lands on the right screen.
+    let mut mi: MONITORINFO = std::mem::zeroed();
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    let hmon = MonitorFromPoint(POINT { x: cx, y: cy }, MONITOR_DEFAULTTONEAREST);
+    GetMonitorInfoW(hmon, &mut mi);
+    let wa = mi.rcWork;
     let xx = cx.min(wa.right - a.width).max(wa.left);
     let yy = cy.min(wa.bottom - height).max(wa.top);
     a.popup_x = xx;
