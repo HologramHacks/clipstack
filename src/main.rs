@@ -559,7 +559,7 @@ fn poll_clip(a: &mut App) {
 fn set_clipboard(a: &mut App, clip: &Clip) {
     unsafe {
         match clip {
-            Clip::Text(s) => clip_set_text(a.hwnd, s),
+            Clip::Text(s) => set_clipboard_text(a.hwnd, s, false),
             Clip::Image(ic) => clip_set_image(a.hwnd, ic.w, ic.h, &ic.rgba),
         }
         // Don't re-ingest our own write on the next poll.
@@ -644,7 +644,11 @@ fn dib_to_rgba(d: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     }
 
     let masks = if compression == 3 { 12 } else { 0 };
-    let pix_off = hdr + masks + clr_used * 4;
+    // Fully checked so a hostile clrUsed can't overflow the offset (matters only
+    // on a hypothetical 32-bit build; harmless and clearer on x86_64).
+    let pix_off = hdr
+        .checked_add(masks)?
+        .checked_add(clr_used.checked_mul(4)?)?;
     let stride = (w * bpp).div_ceil(32) * 4; // rows are DWORD-aligned
     if pix_off.checked_add(stride.checked_mul(h)?)? > d.len() {
         return None;
@@ -673,9 +677,11 @@ fn dib_to_rgba(d: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     Some((w, h, out))
 }
 
-/// Put plain text on the clipboard (CF_UNICODETEXT). For a pinned secret use
-/// `set_clipboard_secret`, which also tags it out of history/cloud.
-unsafe fn clip_set_text(hwnd: HWND, s: &str) {
+/// Put text on the clipboard (CF_UNICODETEXT). When `exclude` is set — pasting a
+/// pinned secret — also tag it out of Windows clipboard history (Win+V) and
+/// cloud sync, the way password managers do (these formats have no library, so
+/// it's done by hand here either way).
+unsafe fn set_clipboard_text(hwnd: HWND, s: &str, exclude: bool) {
     if OpenClipboard(hwnd) == 0 {
         return;
     }
@@ -683,6 +689,20 @@ unsafe fn clip_set_text(hwnd: HWND, s: &str) {
     let text: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
     let bytes = std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len() * 2);
     set_clip_data(CF_UNICODETEXT, global_from(bytes));
+    if exclude {
+        // Exclusion tags (each a DWORD 0): keep it out of Win+V and the cloud.
+        let zero = 0u32.to_ne_bytes();
+        for name in [
+            "CanIncludeInClipboardHistory",
+            "CanUploadToCloudClipboard",
+            "ExcludeClipboardContentFromMonitorProcessing",
+        ] {
+            let fmt = RegisterClipboardFormatW(wide(name).as_ptr());
+            if fmt != 0 {
+                set_clip_data(fmt, global_from(&zero));
+            }
+        }
+    }
     CloseClipboard();
 }
 
@@ -737,33 +757,6 @@ unsafe fn set_clip_data(fmt: u32, h: *mut c_void) {
     if SetClipboardData(fmt, h).is_null() {
         GlobalFree(h);
     }
-}
-
-/// Put `s` on the clipboard AND tag it to be excluded from Windows clipboard
-/// history (Win+V) and cloud sync — for pasting a pinned secret, the way
-/// password managers do. Raw Win32 because arboard doesn't expose these formats.
-unsafe fn set_clipboard_secret(hwnd: HWND, s: &str) {
-    if OpenClipboard(hwnd) == 0 {
-        return;
-    }
-    EmptyClipboard();
-    // The text itself (UTF-16, NUL-terminated).
-    let text: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
-    let bytes = std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len() * 2);
-    set_clip_data(CF_UNICODETEXT, global_from(bytes));
-    // Exclusion tags (each a DWORD 0): keep it out of Win+V and the cloud.
-    let zero = 0u32.to_ne_bytes();
-    for name in [
-        "CanIncludeInClipboardHistory",
-        "CanUploadToCloudClipboard",
-        "ExcludeClipboardContentFromMonitorProcessing",
-    ] {
-        let fmt = RegisterClipboardFormatW(wide(name).as_ptr());
-        if fmt != 0 {
-            set_clip_data(fmt, global_from(&zero));
-        }
-    }
-    CloseClipboard();
 }
 
 // ---- Pin persistence (DPAPI) ----------------------------------------------
@@ -1534,7 +1527,7 @@ fn commit_row(a: &mut App, idx: usize) -> HWND {
         RowKind::Pin(j) => {
             let mut s = unprotect_secret(&a.pins[j].secret_enc, a.pins[j].len);
             unsafe {
-                set_clipboard_secret(a.hwnd, &s); // excluded from Win+V history + cloud
+                set_clipboard_text(a.hwnd, &s, true); // excluded from Win+V history + cloud
                 a.last_seq = GetClipboardSequenceNumber(); // don't re-ingest our own write
             }
             scrub_string(&mut s); // wipe our transient plaintext (the live clipboard copy is inherent)
