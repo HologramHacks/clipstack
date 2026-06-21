@@ -76,6 +76,7 @@ const ID_PAUSE: usize = 101;
 const ID_CLEAR: usize = 102;
 const ID_QUIT: usize = 103;
 const ID_STARTUP: usize = 104;
+const ID_PERSIST: usize = 105;
 
 // HKCU Run-key entry for the optional "launch at startup" toggle.
 const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -218,8 +219,10 @@ struct App {
     paused: bool,
     visible: bool,
     trigger: Trigger,
-    hotkey_active: bool, // a keyboard trigger is currently registered
-    capturing: bool,     // listening for a custom trigger
+    hotkey_active: bool,  // a keyboard trigger is currently registered
+    capturing: bool,      // listening for a custom trigger
+    persist: bool,        // remember history across restarts (opt-in)
+    history_dirty: bool,  // history changed since the last flush to disk
     edit: Option<Edit>,  // inline pin-labeling in progress
     caret_on: bool,      // caret blink phase while editing/capturing
     swallow_up: Option<u32>, // button-up message to swallow after a trigger
@@ -447,6 +450,7 @@ fn make_thumb(w: usize, h: usize, rgba: &[u8]) -> (i32, i32, Vec<u8>) {
 }
 
 fn add_text(a: &mut App, t: String) {
+    a.history_dirty = true;
     if let Some(pos) = a
         .history
         .iter()
@@ -670,8 +674,8 @@ fn settings_path() -> std::path::PathBuf {
     p
 }
 
-fn save_trigger(t: Trigger) {
-    let line = match t {
+fn trigger_line(t: Trigger) -> String {
+    match t {
         Trigger::Mouse { btn, mods } => {
             let b = match btn {
                 Btn::Middle => "middle",
@@ -681,43 +685,104 @@ fn save_trigger(t: Trigger) {
             format!("trigger=mouse:{}:{}\n", b, mods_token(mods))
         }
         Trigger::Key { vk, mods } => format!("trigger=key:{}:{}\n", vk, mods_token(mods)),
-    };
-    let _ = std::fs::write(settings_path(), line);
+    }
 }
 
-fn load_trigger() -> Trigger {
-    let text = match std::fs::read_to_string(settings_path()) {
-        Ok(t) => t,
-        Err(_) => return Trigger::MIDDLE,
-    };
-    for line in text.lines() {
-        if let Some(v) = line.trim().strip_prefix("trigger=") {
-            let mut parts = v.split(':');
-            match (parts.next(), parts.next(), parts.next()) {
-                (Some("mouse"), Some(b), mods) => {
-                    let btn = match b {
-                        "x1" => Btn::X1,
-                        "x2" => Btn::X2,
-                        _ => Btn::Middle,
-                    };
-                    return Trigger::Mouse { btn, mods: parse_mods(mods.unwrap_or("")) };
-                }
-                (Some("key"), Some(vk), mods) => {
-                    if let Ok(vk) = vk.parse::<u32>() {
-                        let mods = parse_mods(mods.unwrap_or(""));
-                        // Same guardrail as live capture: a keyboard trigger must
-                        // be a real vk with at least one modifier, so a stale or
-                        // hand-edited file can't bind a bare key globally.
-                        if vk <= 0xFF && mods != 0 {
-                            return Trigger::Key { vk, mods };
+fn save_settings(trigger: Trigger, persist: bool) {
+    let mut s = trigger_line(trigger);
+    s.push_str(if persist { "persist=1\n" } else { "persist=0\n" });
+    let _ = std::fs::write(settings_path(), s);
+}
+
+fn load_settings() -> (Trigger, bool) {
+    let mut trigger = Trigger::MIDDLE;
+    let mut persist = false;
+    if let Ok(text) = std::fs::read_to_string(settings_path()) {
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("trigger=") {
+                let mut parts = v.split(':');
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some("mouse"), Some(b), mods) => {
+                        let btn = match b {
+                            "x1" => Btn::X1,
+                            "x2" => Btn::X2,
+                            _ => Btn::Middle,
+                        };
+                        trigger = Trigger::Mouse { btn, mods: parse_mods(mods.unwrap_or("")) };
+                    }
+                    (Some("key"), Some(vk), mods) => {
+                        if let Ok(vk) = vk.parse::<u32>() {
+                            let mods = parse_mods(mods.unwrap_or(""));
+                            // Guardrail (also enforced at capture): a keyboard
+                            // trigger needs a real vk + a modifier, so a stale or
+                            // hand-edited file can't bind a bare key globally.
+                            if vk <= 0xFF && mods != 0 {
+                                trigger = Trigger::Key { vk, mods };
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
+            } else if let Some(v) = line.strip_prefix("persist=") {
+                persist = v.trim() == "1";
             }
         }
     }
-    Trigger::MIDDLE
+    (trigger, persist)
+}
+
+// ---- History persistence (opt-in, DPAPI-encrypted) ------------------------
+
+/// Per-user history file: %APPDATA%\ClipStack\history.dat. Only written when
+/// the user opts in; holds TEXT clips only, DPAPI-encrypted like pins.
+fn history_path() -> std::path::PathBuf {
+    let mut p = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    p.push("ClipStack");
+    let _ = std::fs::create_dir_all(&p);
+    p.push("history.dat");
+    p
+}
+
+/// Persist the text clips (most-recent-first) DPAPI-encrypted. Images are
+/// skipped — they're memory-only even when "Remember history" is on.
+fn save_history(a: &App) {
+    let mut s = String::new();
+    for c in &a.history {
+        if let Clip::Text(t) = c {
+            s.push_str(&escape(t));
+            s.push('\n');
+        }
+    }
+    if let Some(enc) = dpapi_protect(s.as_bytes()) {
+        let _ = std::fs::write(history_path(), enc);
+    }
+}
+
+/// Load persisted text clips, if any.
+fn load_history() -> Vec<Clip> {
+    let mut history = Vec::new();
+    if let Ok(enc) = std::fs::read(history_path()) {
+        if let Some(bytes) = dpapi_unprotect(&enc) {
+            if let Ok(text) = String::from_utf8(bytes) {
+                for line in text.lines() {
+                    if !line.is_empty() {
+                        history.push(Clip::Text(unescape(line)));
+                    }
+                }
+            }
+        }
+    }
+    while history.len() > MAX_HISTORY {
+        history.pop();
+    }
+    history
+}
+
+fn clear_history_file() {
+    let _ = std::fs::remove_file(history_path());
 }
 
 // ---- Launch at startup (opt-in HKCU Run key) ------------------------------
@@ -1170,6 +1235,7 @@ fn delete_row(a: &mut App, idx: usize) {
         RowKind::Hist(i) => {
             let mut c = a.history.remove(i);
             scrub_clip(&mut c);
+            a.history_dirty = true;
         }
         RowKind::Pin(j) => {
             let mut p = a.pins.remove(j);
@@ -1187,6 +1253,7 @@ fn commit_row(a: &mut App, idx: usize) -> HWND {
             set_clipboard(a, &clip);
             let c = a.history.remove(i);
             a.history.insert(0, c);
+            a.history_dirty = true;
             hide_popup(a);
             a.target
         }
@@ -1322,7 +1389,8 @@ unsafe fn set_trigger(t: Trigger) {
     };
     update_tray_tip(hwnd, &desc);
     if ok {
-        save_trigger(t);
+        let persist = app().persist;
+        save_settings(t, persist);
     } else {
         warn_hotkey_taken(hwnd);
     }
@@ -1427,7 +1495,8 @@ unsafe fn finish_capture(new: Option<Trigger>) {
     };
     if let Some(t) = new {
         if !failed {
-            save_trigger(t);
+            let persist = app().persist;
+            save_settings(t, persist);
         }
     }
     if !restore.is_null() {
@@ -1579,6 +1648,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     // Don't ingest new clips while the popup is open — it would
                     // shift the history indices the on-screen rows point at.
                     poll_clip(&mut *a);
+                }
+                // Flush history to disk if it changed and persistence is on. The
+                // ~0.5s cadence means a crash loses at most half a second.
+                if a.persist && a.history_dirty {
+                    save_history(&*a);
+                    a.history_dirty = false;
                 }
             }
             0
@@ -1809,12 +1884,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let mut a = app();
                     a.history.iter_mut().for_each(scrub_clip);
                     a.history.clear();
+                    a.history_dirty = false;
+                    if a.persist {
+                        clear_history_file(); // wipe the persisted copy too
+                    }
                     hide_popup(&mut *a);
                 }
                 ID_QUIT => {
                     DestroyWindow(hwnd);
                 }
                 ID_STARTUP => set_startup(!startup_enabled()),
+                ID_PERSIST => {
+                    let mut a = app();
+                    a.persist = !a.persist;
+                    save_settings(a.trigger, a.persist);
+                    if a.persist {
+                        save_history(&*a); // capture what's already in memory
+                    } else {
+                        clear_history_file(); // stop remembering: delete the file
+                    }
+                }
                 ID_TRIG_MIDDLE => set_trigger(Trigger::MIDDLE),
                 ID_TRIG_MOUSE4 => set_trigger(Trigger::MOUSE4),
                 ID_TRIG_MOUSE5 => set_trigger(Trigger::MOUSE5),
@@ -1834,9 +1923,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 unsafe fn show_tray_menu(hwnd: HWND) {
-    let (paused, trigger) = {
+    let (paused, trigger, persist) = {
         let a = app();
-        (a.paused, a.trigger)
+        (a.paused, a.trigger, a.persist)
     };
     let mut pt: POINT = std::mem::zeroed();
     GetCursorPos(&mut pt);
@@ -1868,6 +1957,11 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         startup_flags |= MF_CHECKED;
     }
     AppendMenuW(menu, startup_flags, ID_STARTUP, wide("Launch at startup").as_ptr());
+    let mut persist_flags = MF_STRING;
+    if persist {
+        persist_flags |= MF_CHECKED;
+    }
+    AppendMenuW(menu, persist_flags, ID_PERSIST, wide("Remember history").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
 
     let pause_label = if paused { wide("Resume capture") } else { wide("Pause capture") };
@@ -1935,8 +2029,13 @@ unsafe fn cleanup(hwnd: HWND) {
         DeleteObject(a.font as _);
         a.font = null_mut();
     }
-    // Wipe in-memory secrets/clips on exit (history is never written to disk;
-    // only the DPAPI-encrypted pins persist by design).
+    // If the user opted in, persist the latest history before wiping memory.
+    if a.persist && a.history_dirty {
+        save_history(&*a);
+        a.history_dirty = false;
+    }
+    // Wipe in-memory secrets/clips on exit. By default history never touches
+    // disk; only the DPAPI-encrypted pins (and the opt-in history file) persist.
     a.history.iter_mut().for_each(scrub_clip);
     a.history.clear();
     for p in a.pins.iter_mut() {
@@ -1972,14 +2071,15 @@ fn main() {
 
         let clipboard = arboard::Clipboard::new().ok();
         let pins = load_pins();
-        let trigger = load_trigger();
+        let (trigger, persist) = load_settings();
+        let history = if persist { load_history() } else { Vec::new() };
 
         *G.0.borrow_mut() = Some(App {
             hwnd: null_mut(),
             hinst,
             hook: 0,
             clipboard,
-            history: Vec::new(),
+            history,
             pins,
             last_seq: 0,
             rows: Vec::new(),
@@ -1990,6 +2090,8 @@ fn main() {
             trigger,
             hotkey_active: false,
             capturing: false,
+            persist,
+            history_dirty: false,
             edit: None,
             caret_on: false,
             swallow_up: None,
