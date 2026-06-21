@@ -31,10 +31,11 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
     EndPaint, FillRect, FrameRect, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
-    MonitorFromPoint, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER,
-    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC, HFONT, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    MonitorFromPoint, SelectObject, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor,
+    SetWindowRgn, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
+    DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, FW_NORMAL, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS,
+    PAINTSTRUCT, SRCCOPY, STRETCH_HALFTONE, TRANSPARENT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptProtectMemory, CryptUnprotectData, CryptUnprotectMemory,
@@ -88,6 +89,7 @@ const ID_STARTUP: usize = 104;
 const ID_PERSIST: usize = 105;
 const ID_ABOUT: usize = 106;
 const ID_WEBSITE: usize = 107;
+const ID_GITHUB: usize = 108;
 
 // HKCU Run-key entry for the optional "launch at startup" toggle.
 const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -239,6 +241,9 @@ struct App {
     trigger: Trigger,
     hotkey_active: bool,  // a keyboard trigger is currently registered
     capturing: bool,      // listening for a custom trigger
+    about: bool,          // showing the About panel
+    toast: Option<String>, // transient inline message at the bottom of the popup
+    toast_ticks: u32,      // 500ms ticks left before the toast auto-clears
     persist: bool,        // remember history across restarts (opt-in)
     history_dirty: bool,  // history changed since the last flush to disk
     edit: Option<Edit>,  // inline pin-labeling in progress
@@ -1291,6 +1296,8 @@ fn hide_popup(a: &mut App) {
         }
     }
     a.caret_on = false;
+    a.about = false;
+    a.toast = None;
     unsafe { ShowWindow(a.hwnd, SW_HIDE) };
     a.visible = false;
     a.hovered = -1;
@@ -1325,6 +1332,23 @@ unsafe fn draw_x(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
         &mut tr,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
     );
+}
+
+/// Orange pushpin (Segoe MDL2) shown on a hovered text row so it's obvious you
+/// can pin it — mirrors draw_x, but in the icon font and sized to the row.
+unsafe fn draw_pin(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, item_h: i32) {
+    let face = wide("Segoe MDL2 Assets");
+    let f = CreateFontW(
+        -(item_h * 12 / 34), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0,
+        DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32, 0, CLEARTYPE_QUALITY as u32, 0,
+        face.as_ptr(),
+    );
+    let old = SelectObject(hdc, f as _);
+    let mut tr = RECT { left, top, right, bottom };
+    let glyph = wide_no_nul("\u{E718}"); // MDL2 "Pin"
+    DrawTextW(hdc, glyph.as_ptr(), glyph.len() as i32, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(hdc, old);
+    DeleteObject(f as _);
 }
 
 /// Width in pixels of `text` in the font currently selected into `hdc`.
@@ -1401,6 +1425,140 @@ unsafe fn draw_thumb(hdc: HDC, ic: &ImageClip, x: i32, y: i32, maxh: i32) -> i32
     dw
 }
 
+const ABOUT_TAGLINE: &str = "A tiny, no-cloud clipboard manager for Windows.";
+
+unsafe fn open_url(hwnd: HWND, url: &str) {
+    let verb = wide("open");
+    let u = wide(url);
+    ShellExecuteW(hwnd, verb.as_ptr(), u.as_ptr(), null(), null(), SW_SHOWNORMAL);
+}
+
+/// Begin inline pin-labeling for history item `i` (text clips only, up to
+/// MAX_PINS). Shared by the right-click and the pin-glyph click.
+unsafe fn start_pin(i: usize) {
+    let (start, capped) = {
+        let mut a = app();
+        if !matches!(a.history.get(i), Some(Clip::Text(_))) {
+            (None, false) // image (or gone) — can't pin
+        } else if a.pins.len() >= MAX_PINS {
+            (None, true) // at the limit
+        } else {
+            let secret = match a.history.get(i) {
+                Some(Clip::Text(s)) => s.clone(),
+                _ => unreachable!(),
+            };
+            let restore = a.target;
+            a.edit = Some(Edit { hist: i, secret, label: Vec::new(), restore });
+            a.caret_on = true;
+            (Some(a.hwnd), false)
+        }
+    };
+    if let Some(hwnd2) = start {
+        // Briefly drop WS_EX_NOACTIVATE and take keyboard focus so the popup
+        // receives WM_CHAR; end_edit/hide_popup restore it.
+        set_no_activate(hwnd2, false);
+        SetForegroundWindow(hwnd2);
+        SetFocus(hwnd2);
+        InvalidateRect(hwnd2, null(), 1);
+    } else if capped {
+        let mut a = app();
+        a.toast = Some(format!("Pin limit reached ({MAX_PINS}) \u{2014} unpin one first"));
+        a.toast_ticks = 5; // ~2.5s on the 500ms tick
+        InvalidateRect(a.hwnd, null(), 0);
+    }
+}
+
+struct AboutLayout {
+    icon: RECT,
+    title_y: i32,
+    tagline_y: i32,
+    web: (i32, i32), // (top, bottom) of the clickable link band
+    gh: (i32, i32),
+    footer_y: i32,
+    height: i32,
+}
+
+/// Vertical layout of the About panel — shared by the painter and the click
+/// hit-test so the link bands line up exactly with what's drawn.
+fn about_layout(a: &App) -> AboutLayout {
+    let (pad, lh) = (a.pad, a.item_h);
+    let icon_sz = lh * 2;
+    let mut y = pad * 2;
+    let icon = RECT {
+        left: (a.width - icon_sz) / 2,
+        top: y,
+        right: (a.width + icon_sz) / 2,
+        bottom: y + icon_sz,
+    };
+    y = icon.bottom + pad * 2;
+    let title_y = y;
+    y += lh;
+    let tagline_y = y;
+    y += lh + pad;
+    let web = (y, y + lh);
+    y += lh;
+    let gh = (y, y + lh);
+    y += lh + pad;
+    let footer_y = y;
+    y += lh + pad * 2;
+    AboutLayout { icon, title_y, tagline_y, web, gh, footer_y, height: y }
+}
+
+/// Open the About panel near the cursor — an on-brand dark card, not a MessageBox.
+fn show_about(a: &mut App, cx: i32, cy: i32) {
+    let dpi = unsafe { dpi_for_point(cx, cy) };
+    let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+    a.item_h = (26.0 * scale) as i32;
+    a.pad = (6.0 * scale) as i32;
+    a.width = (340.0 * scale) as i32;
+    if !a.font.is_null() {
+        unsafe { DeleteObject(a.font as _) };
+    }
+    a.font = unsafe { make_font(scale) };
+    a.about = true;
+    let height = about_layout(a).height;
+    unsafe {
+        place_and_show(a, cx, cy, height);
+        reconcile_input(a); // keep the hook so a click outside dismisses it
+    }
+}
+
+unsafe fn draw_center(hdc: HDC, a: &App, y: i32, text: &[u16]) {
+    let mut tr = RECT { left: a.pad, top: y, right: a.width - a.pad, bottom: y + a.item_h };
+    DrawTextW(
+        hdc,
+        text.as_ptr(),
+        text.len() as i32,
+        &mut tr,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+    );
+}
+
+unsafe fn paint_about(hdc: HDC, a: &App, rc: &RECT) {
+    let lay = about_layout(a);
+    let sz = lay.icon.right - lay.icon.left;
+    // Load a crisp high-res frame (128px) and let the DC's halftone stretch
+    // smooth the downscale. Requesting the icon at the small panel size made GDI
+    // scale a tiny frame badly — that was the blur.
+    let icon = load_app_icon(128, 128);
+    SetStretchBltMode(hdc, STRETCH_HALFTONE);
+    SetBrushOrgEx(hdc, 0, 0, null_mut());
+    DrawIconEx(hdc, lay.icon.left, lay.icon.top, icon, sz, sz, 0, null_mut(), DI_NORMAL);
+    DestroyIcon(icon);
+    SetTextColor(hdc, COL_TEXT);
+    draw_center(hdc, a, lay.title_y, &wide_no_nul(&format!("ClipStack  v{}", env!("CARGO_PKG_VERSION"))));
+    SetTextColor(hdc, COL_DIM);
+    draw_center(hdc, a, lay.tagline_y, &wide_no_nul(ABOUT_TAGLINE));
+    SetTextColor(hdc, COL_ACCENT);
+    draw_center(hdc, a, lay.web.0, &wide_no_nul("hologramhacks.com"));
+    draw_center(hdc, a, lay.gh.0, &wide_no_nul("github.com/HologramHacks/clipstack"));
+    SetTextColor(hdc, COL_DIM);
+    draw_center(hdc, a, lay.footer_y, &wide_no_nul("Built by Brian Jones"));
+    let border = CreateSolidBrush(COL_ACCENT);
+    FrameRect(hdc, rc, border);
+    DeleteObject(border as _);
+}
+
 unsafe fn paint(hwnd: HWND) {
     let a = app();
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
@@ -1431,8 +1589,16 @@ unsafe fn paint(hwnd: HWND) {
         return;
     }
 
+    if a.about {
+        paint_about(hdc, &a, &rc);
+        SelectObject(hdc, oldf);
+        EndPaint(hwnd, &ps);
+        return;
+    }
+
     let text_left = a.pad * 2;
     let text_right = a.width - a.item_h; // reserve the right column for the ✕
+    let pin_col = a.width - a.item_h * 2; // text rows reserve a pin column too
     let bar_w = (a.pad / 2).max(2); // hovered-row accent bar
     for (idx, r) in a.rows.iter().enumerate() {
         let hovered = idx as i32 == a.hovered;
@@ -1453,7 +1619,7 @@ unsafe fn paint(hwnd: HWND) {
                 match &a.history[i] {
                     Clip::Text(s) => {
                         SetTextColor(hdc, if hovered { COL_WHITE } else { COL_TEXT });
-                        draw_text_row(hdc, text_left, r.top, text_right, r.bottom, &make_preview(s));
+                        draw_text_row(hdc, text_left, r.top, pin_col, r.bottom, &make_preview(s));
                     }
                     Clip::Image(ic) => {
                         let dw = draw_thumb(hdc, ic, text_left, r.top + a.pad, a.item_h - a.pad * 2);
@@ -1464,6 +1630,10 @@ unsafe fn paint(hwnd: HWND) {
                     }
                 }
                 if hovered {
+                    if matches!(&a.history[i], Clip::Text(_)) {
+                        SetTextColor(hdc, COL_ACCENT);
+                        draw_pin(hdc, pin_col, r.top, text_right, r.bottom, a.item_h);
+                    }
                     SetTextColor(hdc, COL_DELETE);
                     draw_x(hdc, text_right, r.top, a.width, r.bottom);
                 }
@@ -1486,6 +1656,22 @@ unsafe fn paint(hwnd: HWND) {
                 }
             }
         }
+    }
+
+    if let Some(msg) = &a.toast {
+        let top = rc.bottom - a.item_h;
+        fill_color(hdc, 0, top, rc.right, rc.bottom, COL_FIELD_BG);
+        fill_color(hdc, 0, top, rc.right, top + 1, COL_ACCENT); // thin orange divider
+        SetTextColor(hdc, COL_ACCENT);
+        let w = wide_no_nul(msg);
+        let mut tr = RECT { left: a.pad * 2, top, right: rc.right - a.pad * 2, bottom: rc.bottom };
+        DrawTextW(
+            hdc,
+            w.as_ptr(),
+            w.len() as i32,
+            &mut tr,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
     }
 
     SelectObject(hdc, oldf);
@@ -1924,6 +2110,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     // shift the history indices the on-screen rows point at.
                     poll_clip(&mut a);
                 }
+                if a.toast.is_some() {
+                    a.toast_ticks = a.toast_ticks.saturating_sub(1);
+                    if a.toast_ticks == 0 {
+                        a.toast = None;
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                }
                 // Flush history to disk if it changed and persistence is on. The
                 // ~0.5s cadence means a crash loses at most half a second.
                 if a.persist && a.history_dirty {
@@ -1975,11 +2168,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_LBUTTONUP => {
+            if app().about {
+                let (_, y) = lo_hi(lp);
+                let lay = about_layout(&app());
+                if y >= lay.web.0 && y < lay.web.1 {
+                    open_url(hwnd, "https://hologramhacks.com");
+                } else if y >= lay.gh.0 && y < lay.gh.1 {
+                    open_url(hwnd, "https://github.com/HologramHacks/clipstack");
+                } else {
+                    hide_popup(&mut app());
+                }
+                return 0;
+            }
             if app().edit.is_some() {
                 return 0; // ignore clicks on rows while labeling; Enter/Esc only
             }
             let (x, y) = lo_hi(lp);
-            let target = {
+            enum Act {
+                Paste(HWND),
+                Pin(usize),
+                None,
+            }
+            let act = {
                 let mut a = app();
                 match row_at(&a, y) {
                     Some(idx) if x >= a.width - a.item_h => {
@@ -1990,16 +2200,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         } else {
                             relayout(&mut a);
                         }
-                        null_mut()
+                        Act::None
                     }
-                    Some(idx) => commit_row(&mut a, idx),
-                    None => null_mut(),
+                    Some(idx) if x >= a.width - a.item_h * 2 => {
+                        // Clicked the pin affordance — text history rows only.
+                        match a.rows[idx].kind {
+                            RowKind::Hist(i) if matches!(a.history.get(i), Some(Clip::Text(_))) => {
+                                Act::Pin(i)
+                            }
+                            _ => Act::Paste(commit_row(&mut a, idx)),
+                        }
+                    }
+                    Some(idx) => Act::Paste(commit_row(&mut a, idx)),
+                    None => Act::None,
                 }
             };
-            if !target.is_null() {
-                SetForegroundWindow(target);
-                std::thread::sleep(Duration::from_millis(40));
-                send_paste();
+            match act {
+                Act::Paste(target) if !target.is_null() => {
+                    SetForegroundWindow(target);
+                    std::thread::sleep(Duration::from_millis(40));
+                    send_paste();
+                }
+                Act::Pin(i) => start_pin(i),
+                _ => {}
             }
             0
         }
@@ -2020,41 +2243,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     save_pins(&a);
                     relayout(&mut a);
                 }
-                Some(RowKind::Hist(i)) => {
-                    // Begin inline labeling: the row turns into a text field.
-                    // Only text clips can be pinned (an image isn't a password),
-                    // and only up to MAX_PINS so the popup stays usable.
-                    let (start, capped) = {
-                        let mut a = app();
-                        if !matches!(a.history.get(i), Some(Clip::Text(_))) {
-                            (None, false) // image (or gone) — can't pin
-                        } else if a.pins.len() >= MAX_PINS {
-                            (None, true) // at the limit — hint instead of editing
-                        } else {
-                            let secret = match a.history.get(i) {
-                                Some(Clip::Text(s)) => s.clone(),
-                                _ => unreachable!(),
-                            };
-                            let restore = a.target;
-                            a.edit = Some(Edit { hist: i, secret, label: Vec::new(), restore });
-                            a.caret_on = true;
-                            (Some(a.hwnd), false)
-                        }
-                    };
-                    if let Some(hwnd2) = start {
-                        // Briefly drop WS_EX_NOACTIVATE and take keyboard focus so
-                        // the popup receives WM_CHAR. end_edit/hide_popup restore it.
-                        set_no_activate(hwnd2, false);
-                        SetForegroundWindow(hwnd2);
-                        SetFocus(hwnd2);
-                        InvalidateRect(hwnd2, null(), 1);
-                    } else if capped {
-                        let text =
-                            wide(&format!("Pin limit reached ({MAX_PINS}). Unpin one first."));
-                        let title = wide("ClipStack");
-                        MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
-                    }
-                }
+                Some(RowKind::Hist(i)) => start_pin(i),
                 _ => {}
             }
             0
@@ -2180,18 +2369,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     DestroyWindow(hwnd);
                 }
                 ID_ABOUT => {
-                    let text = wide(&format!(
-                        "ClipStack v{}\n\nA tiny, no-cloud clipboard-history popup for Windows.\n\nBuilt by Brian Jones\nhologramhacks.com\ngithub.com/HologramHacks/clipstack",
-                        env!("CARGO_PKG_VERSION")
-                    ));
-                    let title = wide("About ClipStack");
-                    MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                    let mut pt: POINT = std::mem::zeroed();
+                    GetCursorPos(&mut pt);
+                    show_about(&mut app(), pt.x, pt.y);
                 }
-                ID_WEBSITE => {
-                    let verb = wide("open");
-                    let url = wide("https://hologramhacks.com");
-                    ShellExecuteW(hwnd, verb.as_ptr(), url.as_ptr(), null(), null(), SW_SHOWNORMAL);
-                }
+                ID_WEBSITE => open_url(hwnd, "https://hologramhacks.com"),
+                ID_GITHUB => open_url(hwnd, "https://github.com/HologramHacks/clipstack"),
                 ID_STARTUP => set_startup(!startup_enabled()),
                 ID_PERSIST => {
                     let mut a = app();
@@ -2269,6 +2452,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let about = format!("About ClipStack v{}", env!("CARGO_PKG_VERSION"));
     AppendMenuW(menu, MF_STRING, ID_ABOUT, wide(&about).as_ptr());
     AppendMenuW(menu, MF_STRING, ID_WEBSITE, wide("hologramhacks.com").as_ptr());
+    AppendMenuW(menu, MF_STRING, ID_GITHUB, wide("GitHub repo").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_QUIT, wide("Quit ClipStack").as_ptr());
     SetForegroundWindow(hwnd);
@@ -2388,6 +2572,9 @@ fn main() {
             trigger,
             hotkey_active: false,
             capturing: false,
+            about: false,
+            toast: None,
+            toast_ticks: 0,
             persist,
             history_dirty: false,
             edit: None,

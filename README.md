@@ -32,9 +32,9 @@ ClipStack sits in your system tray. Middle-click is the default opener (you can 
 | **Mouse wheel** (popup open) | Scrolls through older clips |
 | **Left-click** a row | Copies that clip *and* pastes it into the field you were in |
 | **Click the ✕** on a row | Removes that clip from history |
-| **Right-click** a clip | Pins it with a label (kept until you remove it — up to 8 pins) |
+| **Hover a clip → click the pin** (or right-click it) | Pins it with a label, masked on screen — up to 8 pins, kept until you remove them |
 | **Right-click** a pin | Unpins it |
-| **Right-click the tray icon** | Choose the trigger · Launch at startup · Remember history · Pause capture · Clear history · Quit |
+| **Right-click the tray icon** | Trigger · Launch at startup · Remember history · Pause · Clear history · About · GitHub · Quit |
 
 ### Changing the trigger
 
