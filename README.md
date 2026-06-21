@@ -8,6 +8,10 @@ A tiny clipboard-history popup for Windows. Middle-click anywhere, pick from you
 
 Written in Rust — raw Win32, no UI framework, single file.
 
+<p align="center">
+  <img src="assets/screenshot.png" alt="The ClipStack popup: clipboard history with image thumbnails, dev snippets, and a masked pinned secret" width="460">
+</p>
+
 ## Download & run (no Rust needed)
 
 Grab the latest `clipstack.exe` from the [**Releases**](https://github.com/HologramHacks/clipstack/releases/latest) page and run it. That's it — no installer, no runtime, no dependencies. It's a single ~0.5 MB file that lives in your system tray.
