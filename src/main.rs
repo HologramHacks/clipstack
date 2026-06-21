@@ -169,13 +169,11 @@ impl Trigger {
 
     /// Tray command id if this exactly matches a preset, else the custom slot.
     fn menu_id(self) -> usize {
-        match self {
-            Trigger::MIDDLE => ID_TRIG_MIDDLE,
-            Trigger::MOUSE4 => ID_TRIG_MOUSE4,
-            Trigger::MOUSE5 => ID_TRIG_MOUSE5,
-            Trigger::HOTKEY => ID_TRIG_HOTKEY,
-            _ => ID_TRIG_CUSTOM,
-        }
+        PRESETS
+            .iter()
+            .find(|&&(_, t, _)| t == self)
+            .map(|&(id, _, _)| id)
+            .unwrap_or(ID_TRIG_CUSTOM)
     }
 
     /// Human-readable label, e.g. "Ctrl+Shift+V" or "Ctrl + Mouse 4".
@@ -193,6 +191,15 @@ impl Trigger {
         }
     }
 }
+
+/// The trigger presets, defined once and used by the tray submenu, the radio
+/// check, and the command handler — so they can't drift out of sync.
+const PRESETS: [(usize, Trigger, &str); 4] = [
+    (ID_TRIG_MIDDLE, Trigger::MIDDLE, "Middle click"),
+    (ID_TRIG_MOUSE4, Trigger::MOUSE4, "Mouse 4 (back)"),
+    (ID_TRIG_MOUSE5, Trigger::MOUSE5, "Mouse 5 (forward)"),
+    (ID_TRIG_HOTKEY, Trigger::HOTKEY, "Ctrl + Shift + V (keyboard)"),
+];
 
 #[derive(Clone, Copy)]
 enum RowKind {
@@ -1922,12 +1929,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         clear_history_file(); // stop remembering: delete the file
                     }
                 }
-                ID_TRIG_MIDDLE => set_trigger(Trigger::MIDDLE),
-                ID_TRIG_MOUSE4 => set_trigger(Trigger::MOUSE4),
-                ID_TRIG_MOUSE5 => set_trigger(Trigger::MOUSE5),
-                ID_TRIG_HOTKEY => set_trigger(Trigger::HOTKEY),
                 ID_TRIG_CUSTOM => start_capture(),
-                _ => {}
+                cmd => {
+                    if let Some(&(_, t, _)) = PRESETS.iter().find(|&&(id, _, _)| id == cmd) {
+                        set_trigger(t);
+                    }
+                }
             }
             0
         }
@@ -1951,10 +1958,9 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 
     // Trigger submenu, radio-checked on the active choice.
     let sub = CreatePopupMenu();
-    AppendMenuW(sub, MF_STRING, ID_TRIG_MIDDLE, wide("Middle click").as_ptr());
-    AppendMenuW(sub, MF_STRING, ID_TRIG_MOUSE4, wide("Mouse 4 (back)").as_ptr());
-    AppendMenuW(sub, MF_STRING, ID_TRIG_MOUSE5, wide("Mouse 5 (forward)").as_ptr());
-    AppendMenuW(sub, MF_STRING, ID_TRIG_HOTKEY, wide("Ctrl + Shift + V (keyboard)").as_ptr());
+    for &(id, _, label) in PRESETS.iter() {
+        AppendMenuW(sub, MF_STRING, id, wide(label).as_ptr());
+    }
     AppendMenuW(sub, MF_SEPARATOR, 0, null());
     let custom_label = if trigger.menu_id() == ID_TRIG_CUSTOM {
         wide(&format!("Custom: {}", trigger.describe()))
