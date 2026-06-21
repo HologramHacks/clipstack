@@ -17,7 +17,6 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 #![allow(non_snake_case)]
 
-use std::borrow::Cow;
 use std::cell::{RefCell, RefMut};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::c_void;
@@ -42,10 +41,10 @@ use windows_sys::Win32::Security::Cryptography::{
     CRYPTPROTECTMEMORY_SAME_PROCESS, CRYPT_INTEGER_BLOB,
 };
 use windows_sys::Win32::System::Memory::{
-    GlobalAlloc, GlobalLock, GlobalUnlock, VirtualLock, VirtualUnlock, GMEM_MOVEABLE,
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, VirtualLock, VirtualUnlock, GMEM_MOVEABLE,
 };
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard,
+    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber, OpenClipboard,
     RegisterClipboardFormatW, SetClipboardData,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
@@ -228,7 +227,6 @@ struct App {
     hwnd: HWND,
     hinst: windows_sys::Win32::Foundation::HINSTANCE,
     hook: isize, // WH_MOUSE_LL handle, or 0 when not installed
-    clipboard: Option<arboard::Clipboard>,
     history: Vec<Clip>,
     pins: Vec<Pin>,
     last_seq: u32,
@@ -546,13 +544,11 @@ fn poll_clip(a: &mut App) {
         return;
     }
     a.last_seq = seq;
-    let img = a.clipboard.as_mut().and_then(|c| c.get_image().ok());
-    if let Some(img) = img {
-        add_image(a, img.width, img.height, img.bytes.into_owned());
+    if let Some((w, h, rgba)) = unsafe { clip_get_image(a.hwnd) } {
+        add_image(a, w, h, rgba);
         return;
     }
-    let txt = a.clipboard.as_mut().and_then(|c| c.get_text().ok());
-    if let Some(t) = txt {
+    if let Some(t) = unsafe { clip_get_text(a.hwnd) } {
         if !t.is_empty() {
             add_text(a, t);
         }
@@ -560,25 +556,162 @@ fn poll_clip(a: &mut App) {
 }
 
 fn set_clipboard(a: &mut App, clip: &Clip) {
-    if let Some(cb) = a.clipboard.as_mut() {
+    unsafe {
         match clip {
-            Clip::Text(s) => {
-                let _ = cb.set_text(s.clone());
+            Clip::Text(s) => clip_set_text(a.hwnd, s),
+            Clip::Image(ic) => clip_set_image(a.hwnd, ic.w, ic.h, &ic.rgba),
+        }
+        // Don't re-ingest our own write on the next poll.
+        a.last_seq = GetClipboardSequenceNumber();
+    }
+}
+
+/// Read clipboard text (CF_UNICODETEXT), or None if there's no text.
+unsafe fn clip_get_text(hwnd: HWND) -> Option<String> {
+    if OpenClipboard(hwnd) == 0 {
+        return None;
+    }
+    let mut out = None;
+    let h = GetClipboardData(CF_UNICODETEXT);
+    if !h.is_null() {
+        let p = GlobalLock(h) as *const u16;
+        if !p.is_null() {
+            let max = GlobalSize(h) / 2; // bound the scan; the data is NUL-terminated
+            let mut len = 0;
+            while len < max && *p.add(len) != 0 {
+                len += 1;
             }
-            Clip::Image(ic) => {
-                let _ = cb.set_image(arboard::ImageData {
-                    width: ic.w,
-                    height: ic.h,
-                    bytes: Cow::Owned(ic.rgba.clone()),
-                });
-            }
+            out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)));
+            GlobalUnlock(h);
         }
     }
-    // Don't re-ingest our own write on the next poll.
-    a.last_seq = unsafe { GetClipboardSequenceNumber() };
+    CloseClipboard();
+    out
+}
+
+/// Read a clipboard image (CF_DIB) as top-left-origin RGBA, or None.
+unsafe fn clip_get_image(hwnd: HWND) -> Option<(usize, usize, Vec<u8>)> {
+    if OpenClipboard(hwnd) == 0 {
+        return None;
+    }
+    let mut out = None;
+    let h = GetClipboardData(CF_DIB);
+    if !h.is_null() {
+        let p = GlobalLock(h) as *const u8;
+        if !p.is_null() {
+            out = dib_to_rgba(std::slice::from_raw_parts(p, GlobalSize(h)));
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    out
+}
+
+/// Parse a packed DIB (header + optional masks/palette + pixels) into RGBA.
+/// Defensive against malformed clipboard data: every offset is bounds-checked
+/// and the dimensions are capped, so a bad DIB yields None, never UB. Handles
+/// 24- and 32-bit BI_RGB / BI_BITFIELDS — what real apps put on the clipboard.
+fn dib_to_rgba(d: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    if d.len() < 40 {
+        return None;
+    }
+    let u32_at = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+    let i32_at = |o: usize| i32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+    let u16_at = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]);
+
+    let hdr = u32_at(0) as usize; // biSize
+    if !(40..=d.len()).contains(&hdr) {
+        return None;
+    }
+    let width = i32_at(4);
+    let height = i32_at(8);
+    let bpp = u16_at(14) as usize;
+    let compression = u32_at(16);
+    let clr_used = u32_at(32) as usize;
+
+    if width <= 0 || height == 0 || (bpp != 24 && bpp != 32) {
+        return None;
+    }
+    if compression != 0 && compression != 3 {
+        return None; // only BI_RGB / BI_BITFIELDS
+    }
+    let w = width as usize;
+    let h = height.unsigned_abs() as usize;
+    let top_down = height < 0;
+    if w.checked_mul(h)? > 64_000_000 {
+        return None; // sane ~64 MP cap against a hostile header
+    }
+
+    let masks = if compression == 3 { 12 } else { 0 };
+    let pix_off = hdr + masks + clr_used * 4;
+    let stride = (w * bpp).div_ceil(32) * 4; // rows are DWORD-aligned
+    if pix_off.checked_add(stride.checked_mul(h)?)? > d.len() {
+        return None;
+    }
+
+    let bytespp = bpp / 8;
+    let mut out = vec![0u8; w * h * 4];
+    for row in 0..h {
+        let sy = if top_down { row } else { h - 1 - row };
+        let src = pix_off + sy * stride;
+        for x in 0..w {
+            let s = src + x * bytespp;
+            let o = (row * w + x) * 4;
+            out[o] = d[s + 2]; // R <- DIB byte order is BGRA
+            out[o + 1] = d[s + 1]; // G
+            out[o + 2] = d[s]; // B
+            out[o + 3] = if bpp == 32 { d[s + 3] } else { 255 };
+        }
+    }
+    // 32-bit DIBs often leave alpha as 0 (undefined); treat all-zero as opaque.
+    if bpp == 32 && out.chunks_exact(4).all(|p| p[3] == 0) {
+        for p in out.chunks_exact_mut(4) {
+            p[3] = 255;
+        }
+    }
+    Some((w, h, out))
+}
+
+/// Put plain text on the clipboard (CF_UNICODETEXT). For a pinned secret use
+/// `set_clipboard_secret`, which also tags it out of history/cloud.
+unsafe fn clip_set_text(hwnd: HWND, s: &str) {
+    if OpenClipboard(hwnd) == 0 {
+        return;
+    }
+    EmptyClipboard();
+    let text: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes = std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len() * 2);
+    set_clip_data(CF_UNICODETEXT, global_from(bytes));
+    CloseClipboard();
+}
+
+/// Put an RGBA image on the clipboard as a top-down 32-bit CF_DIB.
+unsafe fn clip_set_image(hwnd: HWND, w: usize, h: usize, rgba: &[u8]) {
+    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return;
+    }
+    let mut dib: Vec<u8> = Vec::with_capacity(40 + w * h * 4);
+    dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+    dib.extend_from_slice(&(w as i32).to_le_bytes()); // biWidth
+    dib.extend_from_slice(&(-(h as i32)).to_le_bytes()); // biHeight (negative = top-down)
+    dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+    dib.extend_from_slice(&((w * h * 4) as u32).to_le_bytes()); // biSizeImage
+    dib.extend_from_slice(&[0u8; 16]); // x/y ppm, clrUsed, clrImportant
+    for px in rgba.chunks_exact(4) {
+        dib.extend_from_slice(&[px[2], px[1], px[0], px[3]]); // RGBA -> BGRA
+    }
+    if OpenClipboard(hwnd) == 0 {
+        return;
+    }
+    EmptyClipboard();
+    set_clip_data(CF_DIB, global_from(&dib));
+    CloseClipboard();
 }
 
 const CF_UNICODETEXT: u32 = 13;
+const CF_DIB: u32 = 8;
 
 /// Allocate a moveable HGLOBAL holding `bytes`, for SetClipboardData (which
 /// takes ownership of it on success).
@@ -2235,7 +2368,6 @@ fn main() {
             RegisterClassW(&wc);
         }
 
-        let clipboard = arboard::Clipboard::new().ok();
         let pins = load_pins();
         let (trigger, persist) = load_settings();
         let history = if persist { load_history() } else { Vec::new() };
@@ -2244,7 +2376,6 @@ fn main() {
             hwnd: null_mut(),
             hinst,
             hook: 0,
-            clipboard,
             history,
             pins,
             last_seq: 0,
@@ -2379,5 +2510,39 @@ mod tests {
     #[test]
     fn decode_trigger_zero_is_none() {
         assert!(decode_trigger(0).is_none());
+    }
+
+    #[test]
+    fn dib_to_rgba_parses_32bit_top_down() {
+        // 1x1, 32-bit, top-down (negative height), BGRA pixel (10,20,30,40).
+        let mut d = vec![0u8; 40];
+        d[0] = 40; // biSize
+        d[4] = 1; // biWidth = 1
+        d[8..12].copy_from_slice(&(-1i32).to_le_bytes()); // biHeight = -1
+        d[12] = 1; // biPlanes
+        d[14] = 32; // biBitCount
+        d.extend_from_slice(&[10, 20, 30, 40]); // B,G,R,A
+        let (w, h, rgba) = dib_to_rgba(&d).unwrap();
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(rgba, vec![30, 20, 10, 40]); // R,G,B,A
+    }
+
+    #[test]
+    fn dib_to_rgba_rejects_malformed() {
+        assert!(dib_to_rgba(&[]).is_none());
+        assert!(dib_to_rgba(&[0u8; 10]).is_none()); // too short for a header
+        let mut bad_bpp = vec![0u8; 40];
+        bad_bpp[0] = 40;
+        bad_bpp[4] = 1;
+        bad_bpp[8] = 1;
+        bad_bpp[14] = 7; // unsupported bit depth
+        assert!(dib_to_rgba(&bad_bpp).is_none());
+        // Header claims 1000x1000 but carries no pixel data — bounds check rejects.
+        let mut huge = vec![0u8; 40];
+        huge[0] = 40;
+        huge[4..8].copy_from_slice(&1000i32.to_le_bytes());
+        huge[8..12].copy_from_slice(&1000i32.to_le_bytes());
+        huge[14] = 32;
+        assert!(dib_to_rgba(&huge).is_none());
     }
 }

@@ -1,11 +1,10 @@
 [package]
 name = "clipstack"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Tiny clipboard history popup for Windows (configurable trigger)"
 
 [dependencies]
-arboard = "3"
 
 [dependencies.windows-sys]
 version = "0.59"

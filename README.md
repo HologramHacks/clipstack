@@ -8,7 +8,7 @@
 
 A tiny clipboard-history popup for Windows. Middle-click anywhere, pick from your last 50 clips, and it pastes straight into whatever field you were typing in.
 
-Written in Rust — raw Win32, no UI framework, single file.
+Written in Rust — raw Win32, no UI framework, single file, **zero third-party dependencies** (just the Windows API bindings).
 
 <p align="center">
   <img src="assets/screenshot.png" alt="The ClipStack popup: clipboard history with image thumbnails, dev snippets, and a masked pinned secret" width="460">
@@ -68,7 +68,7 @@ The binary lands at `target/release/clipstack.exe`. Run it; it lives in the tray
 
 ## How it works (the short version)
 
-Everything runs single-threaded on one Win32 message loop. The low-level mouse hook and the window procedure both run on that one thread, so the global state is only ever touched there — borrows are scoped so the `&mut` is never held across a call that pumps messages (menus, dialogs). Clips are deduped by hash. Pinned secrets are held encrypted in RAM with `CryptProtectMemory` (pages `VirtualLock`'d out of the pagefile) and DPAPI-encrypted (`CryptProtectData`) on disk.
+Everything runs single-threaded on one Win32 message loop. The low-level mouse hook and the window procedure both run on that one thread, so the global state is only ever touched there — borrows are scoped so the `&mut` is never held across a call that pumps messages (menus, dialogs). Clips are deduped by hash. Reading and writing the clipboard goes straight through the Win32 API — `CF_UNICODETEXT` for text, `CF_DIB` for images (with a bounds-checked DIB parser for the untrusted clipboard data) — so there's no clipboard library, no third-party crates at all. Pinned secrets are held encrypted in RAM with `CryptProtectMemory` (pages `VirtualLock`'d out of the pagefile) and DPAPI-encrypted (`CryptProtectData`) on disk.
 
 ## Why I built it
 
