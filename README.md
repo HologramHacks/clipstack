@@ -16,7 +16,7 @@ First launch shows a Windows SmartScreen warning (it's unsigned) — click **Mor
 
 ## Using it
 
-ClipStack sits in your system tray. Everything is driven by the mouse:
+ClipStack sits in your system tray. Middle-click is the default opener (you can remap it — see below):
 
 | Action | What happens |
 |---|---|
@@ -26,7 +26,13 @@ ClipStack sits in your system tray. Everything is driven by the mouse:
 | **Click the ✕** on a row | Removes that clip from history |
 | **Right-click** a clip | Pins it with a label (kept until you remove it) |
 | **Right-click** a pin | Unpins it |
-| **Right-click the tray icon** | Pause capture · Clear history · Quit |
+| **Right-click the tray icon** | Choose the trigger · Pause capture · Clear history · Quit |
+
+### Changing the trigger
+
+Middle-click is the default, but you can remap it from the tray: **right-click the tray icon → Trigger**. Pick a preset (middle, Mouse 4 / Mouse 5, or **Ctrl+Shift+V**), or choose **Set custom trigger…** and press any modifier+key combo or mouse button. When a mouse button is your trigger, ClipStack takes it over completely — so e.g. a Back/Forward button stops navigating while it's mapped. A keyboard trigger leaves the mouse untouched until you press it (handy if you use the middle/thumb buttons in apps like games or 3D tools). Your choice is remembered across restarts.
+
+> Got a mouse with extra buttons? Windows only exposes five buttons to apps (left, right, middle, and the two thumb buttons), so the rest aren't visible to ClipStack — or any app. Map one to a key combo in your mouse software, then set that combo as a custom trigger.
 
 ## What it does
 
@@ -58,6 +64,8 @@ I wanted a clipboard manager that was instant, stayed out of the way, and didn't
 
 - Clipboard **history lives only in memory** — it is never written to disk, and it is wiped on exit.
 - **Pinned secrets** are encrypted at rest with Windows DPAPI (per-user) in `%APPDATA%\ClipStack\pins.dat`. That protects them on disk, but note the limits: any program running as the *same Windows user* can ask DPAPI to decrypt them, and when you paste a pin it lands on the normal Windows clipboard in cleartext (that's the whole point). So treat it as "encrypted at rest, per user," not "hidden from everything."
+- ClipStack uses a **global mouse hook** (to catch your open shortcut) and **reads the clipboard on a short timer** (that's how history is built) — the same behaviors some malware uses, so an unsigned build may trip a SmartScreen or antivirus warning. It's all local: no keystroke logging, nothing leaves your machine, and the full source is right here to check.
+- Your trigger choice is saved in plaintext at `%APPDATA%\ClipStack\settings.txt` — it's just a key/button name, not a secret.
 - **No network, no telemetry, no analytics.** ClipStack never opens a network connection.
 
 ## License
