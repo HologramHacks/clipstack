@@ -69,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "clipstack"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "arboard",
  "windows-sys 0.59.0",
