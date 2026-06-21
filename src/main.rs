@@ -47,7 +47,8 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::{
-    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    MDT_EFFECTIVE_DPI,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyNameTextW, MapVirtualKeyW, RegisterHotKey, SendInput, SetFocus,
@@ -917,7 +918,7 @@ fn show_popup(a: &mut App, cx: i32, cy: i32) {
     if a.history.is_empty() && a.pins.is_empty() {
         return;
     }
-    let dpi = unsafe { GetDpiForWindow(a.hwnd) };
+    let dpi = unsafe { dpi_for_point(cx, cy) };
     let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
     a.item_h = (34.0 * scale) as i32;
     a.sep_h = (12.0 * scale) as i32;
@@ -943,6 +944,17 @@ fn show_popup(a: &mut App, cx: i32, cy: i32) {
 unsafe fn round_window(hwnd: HWND, w: i32, h: i32) {
     let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, CORNER_RADIUS, CORNER_RADIUS);
     SetWindowRgn(hwnd, rgn, 1);
+}
+
+/// Effective DPI of the monitor under a screen point. We read the *target*
+/// monitor (where the popup is about to open) rather than GetDpiForWindow,
+/// which would report the monitor the window currently sits on — so the very
+/// first open on a differently-scaled screen uses the correct scale.
+unsafe fn dpi_for_point(cx: i32, cy: i32) -> u32 {
+    let hmon = MonitorFromPoint(POINT { x: cx, y: cy }, MONITOR_DEFAULTTONEAREST);
+    let (mut dx, mut dy) = (96u32, 96u32);
+    GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+    dx
 }
 
 /// Clamp `(cx, cy)` + the window size into the work area, move the window
@@ -989,7 +1001,7 @@ unsafe fn make_font(scale: f32) -> HFONT {
 
 /// Show the single-row "press a trigger" prompt near the cursor.
 fn show_capture_prompt(a: &mut App, cx: i32, cy: i32) {
-    let dpi = unsafe { GetDpiForWindow(a.hwnd) };
+    let dpi = unsafe { dpi_for_point(cx, cy) };
     let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
     a.item_h = (34.0 * scale) as i32;
     a.pad = (6.0 * scale) as i32;
