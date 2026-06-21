@@ -4,6 +4,8 @@
 
 # ClipStack
 
+[![CI](https://github.com/HologramHacks/clipstack/actions/workflows/ci.yml/badge.svg)](https://github.com/HologramHacks/clipstack/actions/workflows/ci.yml)
+
 A tiny clipboard-history popup for Windows. Middle-click anywhere, pick from your last 50 clips, and it pastes straight into whatever field you were typing in.
 
 Written in Rust — raw Win32, no UI framework, single file.
