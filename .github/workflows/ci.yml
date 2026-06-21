@@ -24,6 +24,23 @@ jobs:
       - name: Tests
         run: cargo test --verbose
 
+  # The release exe is built locally with the GNU toolchain, but the job above
+  # uses MSVC — so an MSVC-green dependency can still be unbuildable locally
+  # (this bit us with windows-sys 0.61 / dlltool). This job mirrors the local
+  # toolchain so that class of breakage shows up in CI.
+  build-gnu:
+    name: Build (GNU toolchain)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+      - name: Build (release)
+        run: cargo build --release --verbose
+      - name: Tests
+        run: cargo test --verbose
+
   audit:
     name: Dependency audit (RustSec)
     runs-on: ubuntu-latest
