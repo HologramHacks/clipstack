@@ -26,13 +26,17 @@ ClipStack sits in your system tray. Middle-click is the default opener (you can 
 | **Click the ✕** on a row | Removes that clip from history |
 | **Right-click** a clip | Pins it with a label (kept until you remove it) |
 | **Right-click** a pin | Unpins it |
-| **Right-click the tray icon** | Choose the trigger · Pause capture · Clear history · Quit |
+| **Right-click the tray icon** | Choose the trigger · Launch at startup · Pause capture · Clear history · Quit |
 
 ### Changing the trigger
 
 Middle-click is the default, but you can remap it from the tray: **right-click the tray icon → Trigger**. Pick a preset (middle, Mouse 4 / Mouse 5, or **Ctrl+Shift+V**), or choose **Set custom trigger…** and press any modifier+key combo or mouse button. When a mouse button is your trigger, ClipStack takes it over completely — so e.g. a Back/Forward button stops navigating while it's mapped. A keyboard trigger leaves the mouse untouched until you press it (handy if you use the middle/thumb buttons in apps like games or 3D tools). Your choice is remembered across restarts.
 
 > Got a mouse with extra buttons? Windows only exposes five buttons to apps (left, right, middle, and the two thumb buttons), so the rest aren't visible to ClipStack — or any app. Map one to a key combo in your mouse software, then set that combo as a custom trigger.
+
+### Start with Windows
+
+Right-click the tray icon and tick **Launch at startup** to have ClipStack open when you log in. It's **off by default** and just adds a per-user `Run` entry — untick it to remove. (No admin rights, nothing system-wide.)
 
 ## What it does
 
