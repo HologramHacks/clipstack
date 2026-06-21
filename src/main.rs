@@ -59,8 +59,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     TRACKMOUSEEVENT, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW,
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -81,6 +81,8 @@ const ID_CLEAR: usize = 102;
 const ID_QUIT: usize = 103;
 const ID_STARTUP: usize = 104;
 const ID_PERSIST: usize = 105;
+const ID_ABOUT: usize = 106;
+const ID_WEBSITE: usize = 107;
 
 // HKCU Run-key entry for the optional "launch at startup" toggle.
 const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -1968,6 +1970,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_QUIT => {
                     DestroyWindow(hwnd);
                 }
+                ID_ABOUT => {
+                    let text = wide(&format!(
+                        "ClipStack v{}\n\nA tiny, no-cloud clipboard-history popup for Windows.\n\nBuilt by Brian Jones\nhologramhacks.com\ngithub.com/HologramHacks/clipstack",
+                        env!("CARGO_PKG_VERSION")
+                    ));
+                    let title = wide("About ClipStack");
+                    MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                }
+                ID_WEBSITE => {
+                    let verb = wide("open");
+                    let url = wide("https://hologramhacks.com");
+                    ShellExecuteW(hwnd, verb.as_ptr(), url.as_ptr(), null(), null(), SW_SHOWNORMAL);
+                }
                 ID_STARTUP => set_startup(!startup_enabled()),
                 ID_PERSIST => {
                     let mut a = app();
@@ -2041,6 +2056,10 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let pause_label = if paused { wide("Resume capture") } else { wide("Pause capture") };
     AppendMenuW(menu, MF_STRING, ID_PAUSE, pause_label.as_ptr());
     AppendMenuW(menu, MF_STRING, ID_CLEAR, wide("Clear history").as_ptr());
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    let about = format!("About ClipStack v{}", env!("CARGO_PKG_VERSION"));
+    AppendMenuW(menu, MF_STRING, ID_ABOUT, wide(&about).as_ptr());
+    AppendMenuW(menu, MF_STRING, ID_WEBSITE, wide("hologramhacks.com").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_QUIT, wide("Quit ClipStack").as_ptr());
     SetForegroundWindow(hwnd);
