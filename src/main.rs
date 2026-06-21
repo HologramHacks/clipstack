@@ -285,6 +285,7 @@ const COL_SEP: COLORREF = rgb(0x2e, 0x33, 0x3d); // separators + frame
 const COL_PIN_BULLET: COLORREF = rgb(0x6b, 0x72, 0x80); // masked pin bullets
 const COL_DELETE: COLORREF = rgb(0xff, 0x6b, 0x6b); // hovered-row ✕ delete glyph
 const COL_FIELD_BG: COLORREF = rgb(0x13, 0x16, 0x1b); // inline label input background
+const COL_WHITE: COLORREF = rgb(255, 255, 255); // bright text on a highlighted/active row
 const CORNER_RADIUS: i32 = 12; // rounded-corner diameter for the window region
 
 fn lo_hi(lp: LPARAM) -> (i32, i32) {
@@ -628,15 +629,31 @@ fn unescape(s: &str) -> String {
     out
 }
 
-/// Per-user pins file: %APPDATA%\ClipStack\pins.dat (created on demand).
-fn pins_path() -> std::path::PathBuf {
+/// Path to a per-user file under %APPDATA%\ClipStack, creating the directory
+/// on demand. One builder for pins, settings, and history.
+fn appdata_file(name: &str) -> std::path::PathBuf {
     let mut p = std::env::var_os("APPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     p.push("ClipStack");
     let _ = std::fs::create_dir_all(&p);
-    p.push("pins.dat");
+    p.push(name);
     p
+}
+
+/// DPAPI-encrypt `s` and write it to `path`. Writes nothing if encryption
+/// fails — there is never a plaintext fallback.
+fn write_encrypted(path: std::path::PathBuf, s: &str) {
+    if let Some(enc) = dpapi_protect(s.as_bytes()) {
+        let _ = std::fs::write(path, enc);
+    }
+}
+
+/// Read and DPAPI-decrypt `path` back into a string, if present and valid.
+fn read_encrypted(path: std::path::PathBuf) -> Option<String> {
+    let enc = std::fs::read(path).ok()?;
+    let bytes = dpapi_unprotect(&enc)?;
+    String::from_utf8(bytes).ok()
 }
 
 fn save_pins(a: &App) {
@@ -647,41 +664,26 @@ fn save_pins(a: &App) {
         s.push_str(&escape(&p.secret));
         s.push('\n');
     }
-    if let Some(enc) = dpapi_protect(s.as_bytes()) {
-        let _ = std::fs::write(pins_path(), enc);
-    }
+    write_encrypted(appdata_file("pins.dat"), &s);
 }
 
 fn load_pins() -> Vec<Pin> {
     let mut pins = Vec::new();
-    if let Ok(enc) = std::fs::read(pins_path()) {
-        if let Some(bytes) = dpapi_unprotect(&enc) {
-            if let Ok(text) = String::from_utf8(bytes) {
-                for line in text.lines() {
-                    if let Some((l, sec)) = line.split_once('\t') {
-                        pins.push(Pin {
-                            label: unescape(l),
-                            secret: unescape(sec),
-                        });
-                    }
-                }
+    if let Some(text) = read_encrypted(appdata_file("pins.dat")) {
+        for line in text.lines() {
+            if let Some((l, sec)) = line.split_once('\t') {
+                pins.push(Pin {
+                    label: unescape(l),
+                    secret: unescape(sec),
+                });
             }
         }
     }
     pins
 }
 
-/// Per-user settings file: %APPDATA%\ClipStack\settings.txt. Plaintext — the
-/// trigger choice isn't a secret (unlike the DPAPI-encrypted pins).
-fn settings_path() -> std::path::PathBuf {
-    let mut p = std::env::var_os("APPDATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    p.push("ClipStack");
-    let _ = std::fs::create_dir_all(&p);
-    p.push("settings.txt");
-    p
-}
+// settings.txt is plaintext — the trigger/persist flags aren't secrets
+// (unlike the DPAPI-encrypted pins and history).
 
 fn trigger_line(t: Trigger) -> String {
     match t {
@@ -700,13 +702,13 @@ fn trigger_line(t: Trigger) -> String {
 fn save_settings(trigger: Trigger, persist: bool) {
     let mut s = trigger_line(trigger);
     s.push_str(if persist { "persist=1\n" } else { "persist=0\n" });
-    let _ = std::fs::write(settings_path(), s);
+    let _ = std::fs::write(appdata_file("settings.txt"), s);
 }
 
 fn load_settings() -> (Trigger, bool) {
     let mut trigger = Trigger::MIDDLE;
     let mut persist = false;
-    if let Ok(text) = std::fs::read_to_string(settings_path()) {
+    if let Ok(text) = std::fs::read_to_string(appdata_file("settings.txt")) {
         for line in text.lines() {
             let line = line.trim();
             if let Some(v) = line.strip_prefix("trigger=") {
@@ -743,20 +745,9 @@ fn load_settings() -> (Trigger, bool) {
 
 // ---- History persistence (opt-in, DPAPI-encrypted) ------------------------
 
-/// Per-user history file: %APPDATA%\ClipStack\history.dat. Only written when
-/// the user opts in; holds TEXT clips only, DPAPI-encrypted like pins.
-fn history_path() -> std::path::PathBuf {
-    let mut p = std::env::var_os("APPDATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    p.push("ClipStack");
-    let _ = std::fs::create_dir_all(&p);
-    p.push("history.dat");
-    p
-}
-
-/// Persist the text clips (most-recent-first) DPAPI-encrypted. Images are
-/// skipped — they're memory-only even when "Remember history" is on.
+/// Persist the text clips (most-recent-first) DPAPI-encrypted to history.dat.
+/// Only written when the user opts in; images are skipped — they stay
+/// memory-only even when "Remember history" is on.
 fn save_history(a: &App) {
     let mut s = String::new();
     for c in &a.history {
@@ -765,22 +756,16 @@ fn save_history(a: &App) {
             s.push('\n');
         }
     }
-    if let Some(enc) = dpapi_protect(s.as_bytes()) {
-        let _ = std::fs::write(history_path(), enc);
-    }
+    write_encrypted(appdata_file("history.dat"), &s);
 }
 
 /// Load persisted text clips, if any.
 fn load_history() -> Vec<Clip> {
     let mut history = Vec::new();
-    if let Ok(enc) = std::fs::read(history_path()) {
-        if let Some(bytes) = dpapi_unprotect(&enc) {
-            if let Ok(text) = String::from_utf8(bytes) {
-                for line in text.lines() {
-                    if !line.is_empty() {
-                        history.push(Clip::Text(unescape(line)));
-                    }
-                }
+    if let Some(text) = read_encrypted(appdata_file("history.dat")) {
+        for line in text.lines() {
+            if !line.is_empty() {
+                history.push(Clip::Text(unescape(line)));
             }
         }
     }
@@ -791,7 +776,7 @@ fn load_history() -> Vec<Clip> {
 }
 
 fn clear_history_file() {
-    let _ = std::fs::remove_file(history_path());
+    let _ = std::fs::remove_file(appdata_file("history.dat"));
 }
 
 // ---- Launch at startup (opt-in HKCU Run key) ------------------------------
@@ -1122,7 +1107,7 @@ unsafe fn paint_edit_row(hdc: HDC, a: &App, r: &VRow, text_left: i32) {
         let hint = wide_no_nul("Type a label  \u{2014}  Enter to pin, Esc to cancel");
         draw_text_row(hdc, text_left + a.pad, r.top, tr, r.bottom, &hint);
     } else {
-        SetTextColor(hdc, rgb(255, 255, 255));
+        SetTextColor(hdc, COL_WHITE);
         draw_text_row(hdc, text_left, r.top, tr, r.bottom, &ed.label);
         if a.caret_on {
             let cx = (text_left + text_width(hdc, &ed.label) + 1).min(tr - 2);
@@ -1210,7 +1195,7 @@ unsafe fn paint(hwnd: HWND) {
                 }
                 match &a.history[i] {
                     Clip::Text(s) => {
-                        SetTextColor(hdc, if hovered { rgb(255, 255, 255) } else { COL_TEXT });
+                        SetTextColor(hdc, if hovered { COL_WHITE } else { COL_TEXT });
                         draw_text_row(hdc, text_left, r.top, text_right, r.bottom, &make_preview(s));
                     }
                     Clip::Image(ic) => {
@@ -1236,7 +1221,7 @@ unsafe fn paint(hwnd: HWND) {
                 SetTextColor(hdc, COL_PIN_BULLET);
                 draw_text_row(hdc, text_left, r.top, text_right, r.bottom, &bullets);
                 let lx = text_left + text_width(hdc, &bullets) + a.pad * 3;
-                SetTextColor(hdc, if hovered { rgb(255, 255, 255) } else { COL_TEXT });
+                SetTextColor(hdc, if hovered { COL_WHITE } else { COL_TEXT });
                 draw_text_row(hdc, lx, r.top, text_right, r.bottom, &wide_no_nul(&a.pins[j].label));
                 if hovered {
                     SetTextColor(hdc, COL_DELETE);
@@ -1421,15 +1406,20 @@ unsafe fn set_trigger(t: Trigger) {
     }
 }
 
+/// Fill a tray icon's tooltip with "ClipStack — {desc} to open".
+unsafe fn set_tip(nid: &mut NOTIFYICONDATAW, desc: &str) {
+    let tip = wide(&format!("ClipStack \u{2014} {} to open", desc));
+    let n = tip.len().min(nid.szTip.len());
+    nid.szTip[..n].copy_from_slice(&tip[..n]);
+}
+
 unsafe fn update_tray_tip(hwnd: HWND, desc: &str) {
     let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
     nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
     nid.hWnd = hwnd;
     nid.uID = 1;
     nid.uFlags = NIF_TIP;
-    let tip = wide(&format!("ClipStack \u{2014} {} to open", desc));
-    let n = tip.len().min(nid.szTip.len());
-    nid.szTip[..n].copy_from_slice(&tip[..n]);
+    set_tip(&mut nid, desc);
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
@@ -2027,9 +2017,7 @@ unsafe fn add_tray(hwnd: HWND) {
     let cy = GetSystemMetrics(SM_CYSMICON);
     nid.hIcon = load_app_icon(cx, cy);
     let desc = app().trigger.describe();
-    let tip = wide(&format!("ClipStack \u{2014} {} to open", desc));
-    let n = tip.len().min(nid.szTip.len());
-    nid.szTip[..n].copy_from_slice(&tip[..n]);
+    set_tip(&mut nid, &desc);
     Shell_NotifyIconW(NIM_ADD, &nid);
 }
 
