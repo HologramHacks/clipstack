@@ -46,11 +46,14 @@ use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, SetFocus, TrackMouseEvent, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYEVENTF_KEYUP, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL,
+    GetAsyncKeyState, GetKeyNameTextW, MapVirtualKeyW, RegisterHotKey, SendInput, SetFocus,
+    TrackMouseEvent, UnregisterHotKey, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    MAPVK_VK_TO_VSC, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, TME_LEAVE,
+    TRACKMOUSEEVENT, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -63,11 +66,28 @@ const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_SHOW: u32 = WM_APP + 2; // wparam=x, lparam=y
 const WM_APP_HIDE: u32 = WM_APP + 3;
 const WM_APP_SCROLL: u32 = WM_APP + 4; // wparam: 1=up, 2=down
+const WM_APP_CAPTURED: u32 = WM_APP + 5; // wparam=encoded trigger (0=cancel)
 
 // Tray menu command ids.
 const ID_PAUSE: usize = 101;
 const ID_CLEAR: usize = 102;
 const ID_QUIT: usize = 103;
+
+// Trigger submenu command ids (kept contiguous for CheckMenuRadioItem).
+const ID_TRIG_MIDDLE: usize = 201;
+const ID_TRIG_MOUSE4: usize = 202;
+const ID_TRIG_MOUSE5: usize = 203;
+const ID_TRIG_HOTKEY: usize = 204; // the Ctrl+Shift+V preset
+const ID_TRIG_CUSTOM: usize = 205; // "Set custom trigger…" / current custom
+
+/// RegisterHotKey id for whichever keyboard combo is the active trigger.
+const ID_HOTKEY: i32 = 1;
+
+// Our own modifier bitmask (independent of the Win32 MOD_* flags).
+const M_CTRL: u8 = 1;
+const M_SHIFT: u8 = 2;
+const M_ALT: u8 = 4;
+const M_WIN: u8 = 8;
 
 const TIMER_CLIP: usize = 1;
 const HC_ACTION: i32 = 0;
@@ -109,6 +129,60 @@ struct Edit {
     restore: HWND,   // foreground window to hand focus back to when done
 }
 
+/// A non-typing mouse button usable as a trigger.
+#[derive(Clone, Copy, PartialEq)]
+enum Btn {
+    Middle,
+    X1, // "back"
+    X2, // "forward"
+}
+
+/// How the user opens the popup. Exactly one is active; persisted to
+/// settings.txt and applied live from the tray. Either a mouse button or a
+/// keyboard key, each with an optional modifier mask (`M_*`).
+#[derive(Clone, Copy, PartialEq)]
+enum Trigger {
+    Mouse { btn: Btn, mods: u8 },
+    Key { vk: u32, mods: u8 },
+}
+
+impl Trigger {
+    const MIDDLE: Trigger = Trigger::Mouse { btn: Btn::Middle, mods: 0 };
+    const MOUSE4: Trigger = Trigger::Mouse { btn: Btn::X1, mods: 0 };
+    const MOUSE5: Trigger = Trigger::Mouse { btn: Btn::X2, mods: 0 };
+    const HOTKEY: Trigger = Trigger::Key { vk: 0x56, mods: M_CTRL | M_SHIFT }; // Ctrl+Shift+V
+
+    fn is_key(self) -> bool {
+        matches!(self, Trigger::Key { .. })
+    }
+
+    /// Tray command id if this exactly matches a preset, else the custom slot.
+    fn menu_id(self) -> usize {
+        match self {
+            Trigger::MIDDLE => ID_TRIG_MIDDLE,
+            Trigger::MOUSE4 => ID_TRIG_MOUSE4,
+            Trigger::MOUSE5 => ID_TRIG_MOUSE5,
+            Trigger::HOTKEY => ID_TRIG_HOTKEY,
+            _ => ID_TRIG_CUSTOM,
+        }
+    }
+
+    /// Human-readable label, e.g. "Ctrl+Shift+V" or "Ctrl + Mouse 4".
+    fn describe(self) -> String {
+        match self {
+            Trigger::Mouse { btn, mods } => {
+                let name = match btn {
+                    Btn::Middle => "Middle click",
+                    Btn::X1 => "Mouse 4 (back)",
+                    Btn::X2 => "Mouse 5 (forward)",
+                };
+                format!("{}{}", mods_prefix(mods), name)
+            }
+            Trigger::Key { vk, mods } => format!("{}{}", mods_prefix(mods), vk_name(vk)),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum RowKind {
     Sep,
@@ -124,7 +198,8 @@ struct VRow {
 
 struct App {
     hwnd: HWND,
-    hook: isize,
+    hinst: windows_sys::Win32::Foundation::HINSTANCE,
+    hook: isize, // WH_MOUSE_LL handle, or 0 when not installed
     clipboard: Option<arboard::Clipboard>,
     history: Vec<Clip>,
     pins: Vec<Pin>,
@@ -134,10 +209,13 @@ struct App {
     target: HWND,
     paused: bool,
     visible: bool,
-    edit: Option<Edit>, // inline pin-labeling in progress
-    caret_on: bool,     // caret blink phase while editing
-    swallow_mup: bool,
-    hovered: i32, // index into `rows`, or -1
+    trigger: Trigger,
+    hotkey_active: bool, // a keyboard trigger is currently registered
+    capturing: bool,     // listening for a custom trigger
+    edit: Option<Edit>,  // inline pin-labeling in progress
+    caret_on: bool,      // caret blink phase while editing/capturing
+    swallow_up: Option<u32>, // button-up message to swallow after a trigger
+    hovered: i32,            // index into `rows`, or -1
     tracking_leave: bool,
     font: HFONT,
     item_h: i32,
@@ -192,6 +270,115 @@ const CORNER_RADIUS: i32 = 12; // rounded-corner diameter for the window region
 fn lo_hi(lp: LPARAM) -> (i32, i32) {
     let v = lp as u32;
     ((v & 0xffff) as i16 as i32, ((v >> 16) & 0xffff) as i16 as i32)
+}
+
+// ---- Trigger helpers ------------------------------------------------------
+
+/// Which modifier keys are physically held right now (`M_*` bitmask).
+fn cur_mods() -> u8 {
+    let down = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0;
+    let mut m = 0;
+    if down(VK_CONTROL) {
+        m |= M_CTRL;
+    }
+    if down(VK_SHIFT) {
+        m |= M_SHIFT;
+    }
+    if down(VK_MENU) {
+        m |= M_ALT;
+    }
+    if down(VK_LWIN) || down(VK_RWIN) {
+        m |= M_WIN;
+    }
+    m
+}
+
+/// Translate our `M_*` mask into Win32 `MOD_*` flags for RegisterHotKey.
+fn to_win32_mods(m: u8) -> u32 {
+    let mut r = 0;
+    if m & M_CTRL != 0 {
+        r |= MOD_CONTROL;
+    }
+    if m & M_SHIFT != 0 {
+        r |= MOD_SHIFT;
+    }
+    if m & M_ALT != 0 {
+        r |= MOD_ALT;
+    }
+    if m & M_WIN != 0 {
+        r |= MOD_WIN;
+    }
+    r
+}
+
+/// "Ctrl+Alt+Shift+Win+" prefix for a modifier mask (empty if none).
+fn mods_prefix(m: u8) -> String {
+    let mut s = String::new();
+    if m & M_CTRL != 0 {
+        s.push_str("Ctrl+");
+    }
+    if m & M_ALT != 0 {
+        s.push_str("Alt+");
+    }
+    if m & M_SHIFT != 0 {
+        s.push_str("Shift+");
+    }
+    if m & M_WIN != 0 {
+        s.push_str("Win+");
+    }
+    s
+}
+
+/// Compact "CSAW" token (subset) used in the settings file.
+fn mods_token(m: u8) -> String {
+    let mut s = String::new();
+    if m & M_CTRL != 0 {
+        s.push('C');
+    }
+    if m & M_SHIFT != 0 {
+        s.push('S');
+    }
+    if m & M_ALT != 0 {
+        s.push('A');
+    }
+    if m & M_WIN != 0 {
+        s.push('W');
+    }
+    s
+}
+
+fn parse_mods(s: &str) -> u8 {
+    let mut m = 0;
+    for c in s.chars() {
+        match c {
+            'C' => m |= M_CTRL,
+            'S' => m |= M_SHIFT,
+            'A' => m |= M_ALT,
+            'W' => m |= M_WIN,
+            _ => {}
+        }
+    }
+    m
+}
+
+/// True for the modifier virtual-keys themselves (so capture waits for a real key).
+fn is_modifier_vk(vk: u32) -> bool {
+    matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C) || (0xA0..=0xA5).contains(&vk)
+}
+
+/// Best-effort display name for a virtual key (e.g. "V", "F5", "Space").
+fn vk_name(vk: u32) -> String {
+    unsafe {
+        let sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        let lparam = (sc << 16) as i32;
+        let mut buf = [0u16; 32];
+        let n = GetKeyNameTextW(lparam, buf.as_mut_ptr(), buf.len() as i32);
+        if n > 0 {
+            String::from_utf16_lossy(&buf[..n as usize])
+        } else {
+            format!("key {:#x}", vk)
+        }
+    }
 }
 
 /// Collapse a string into a single-line preview (utf16, no NUL).
@@ -463,6 +650,68 @@ fn load_pins() -> Vec<Pin> {
     pins
 }
 
+/// Per-user settings file: %APPDATA%\ClipStack\settings.txt. Plaintext — the
+/// trigger choice isn't a secret (unlike the DPAPI-encrypted pins).
+fn settings_path() -> std::path::PathBuf {
+    let mut p = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    p.push("ClipStack");
+    let _ = std::fs::create_dir_all(&p);
+    p.push("settings.txt");
+    p
+}
+
+fn save_trigger(t: Trigger) {
+    let line = match t {
+        Trigger::Mouse { btn, mods } => {
+            let b = match btn {
+                Btn::Middle => "middle",
+                Btn::X1 => "x1",
+                Btn::X2 => "x2",
+            };
+            format!("trigger=mouse:{}:{}\n", b, mods_token(mods))
+        }
+        Trigger::Key { vk, mods } => format!("trigger=key:{}:{}\n", vk, mods_token(mods)),
+    };
+    let _ = std::fs::write(settings_path(), line);
+}
+
+fn load_trigger() -> Trigger {
+    let text = match std::fs::read_to_string(settings_path()) {
+        Ok(t) => t,
+        Err(_) => return Trigger::MIDDLE,
+    };
+    for line in text.lines() {
+        if let Some(v) = line.trim().strip_prefix("trigger=") {
+            let mut parts = v.split(':');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some("mouse"), Some(b), mods) => {
+                    let btn = match b {
+                        "x1" => Btn::X1,
+                        "x2" => Btn::X2,
+                        _ => Btn::Middle,
+                    };
+                    return Trigger::Mouse { btn, mods: parse_mods(mods.unwrap_or("")) };
+                }
+                (Some("key"), Some(vk), mods) => {
+                    if let Ok(vk) = vk.parse::<u32>() {
+                        let mods = parse_mods(mods.unwrap_or(""));
+                        // Same guardrail as live capture: a keyboard trigger must
+                        // be a real vk with at least one modifier, so a stale or
+                        // hand-edited file can't bind a bare key globally.
+                        if vk <= 0xFF && mods != 0 {
+                            return Trigger::Key { vk, mods };
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Trigger::MIDDLE
+}
+
 // ---- Layout & paint -------------------------------------------------------
 
 fn rebuild_rows(a: &mut App) {
@@ -518,56 +767,15 @@ fn show_popup(a: &mut App, cx: i32, cy: i32) {
     if !a.font.is_null() {
         unsafe { DeleteObject(a.font as _) };
     }
-    let face = wide("Segoe UI");
-    a.font = unsafe {
-        CreateFontW(
-            -((13.0 * scale) as i32),
-            0,
-            0,
-            0,
-            FW_NORMAL as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            OUT_DEFAULT_PRECIS as u32,
-            0,
-            CLEARTYPE_QUALITY as u32,
-            0,
-            face.as_ptr(),
-        )
-    };
+    a.font = unsafe { make_font(scale) };
 
     a.scroll = 0;
     rebuild_rows(a);
     let height = rows_height(a);
 
-    let mut wa: RECT = unsafe { std::mem::zeroed() };
-    unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut _ as _, 0) };
-    let mut xx = cx;
-    let mut yy = cy;
-    if xx + a.width > wa.right {
-        xx = wa.right - a.width;
-    }
-    if yy + height > wa.bottom {
-        yy = wa.bottom - height;
-    }
-    if xx < wa.left {
-        xx = wa.left;
-    }
-    if yy < wa.top {
-        yy = wa.top;
-    }
-    a.popup_x = xx;
-    a.popup_y = yy;
-
-    unsafe {
-        SetWindowPos(a.hwnd, HWND_TOPMOST, xx, yy, a.width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        round_window(a.hwnd, a.width, height);
-        InvalidateRect(a.hwnd, null(), 1);
-    }
-    a.visible = true;
+    unsafe { place_and_show(a, cx, cy, height) };
     a.hovered = -1;
+    unsafe { reconcile_input(a) }; // a keyboard trigger needs the hook while open
 }
 
 /// Clip the window to a rounded rectangle. The system takes ownership of the
@@ -575,6 +783,59 @@ fn show_popup(a: &mut App, cx: i32, cy: i32) {
 unsafe fn round_window(hwnd: HWND, w: i32, h: i32) {
     let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, CORNER_RADIUS, CORNER_RADIUS);
     SetWindowRgn(hwnd, rgn, 1);
+}
+
+/// Clamp `(cx, cy)` + the window size into the work area, move the window
+/// there, round it, and show it. Shared by the history popup and the capture
+/// prompt so the placement math lives in exactly one place.
+unsafe fn place_and_show(a: &mut App, cx: i32, cy: i32, height: i32) {
+    let mut wa: RECT = std::mem::zeroed();
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut _ as _, 0);
+    let xx = cx.min(wa.right - a.width).max(wa.left);
+    let yy = cy.min(wa.bottom - height).max(wa.top);
+    a.popup_x = xx;
+    a.popup_y = yy;
+    SetWindowPos(a.hwnd, HWND_TOPMOST, xx, yy, a.width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    round_window(a.hwnd, a.width, height);
+    InvalidateRect(a.hwnd, null(), 1);
+    a.visible = true;
+}
+
+/// The popup's Segoe UI font at the given DPI scale.
+unsafe fn make_font(scale: f32) -> HFONT {
+    let face = wide("Segoe UI");
+    CreateFontW(
+        -((13.0 * scale) as i32),
+        0,
+        0,
+        0,
+        FW_NORMAL as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET as u32,
+        OUT_DEFAULT_PRECIS as u32,
+        0,
+        CLEARTYPE_QUALITY as u32,
+        0,
+        face.as_ptr(),
+    )
+}
+
+/// Show the single-row "press a trigger" prompt near the cursor.
+fn show_capture_prompt(a: &mut App, cx: i32, cy: i32) {
+    let dpi = unsafe { GetDpiForWindow(a.hwnd) };
+    let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+    a.item_h = (34.0 * scale) as i32;
+    a.pad = (6.0 * scale) as i32;
+    a.width = (460.0 * scale) as i32;
+    if !a.font.is_null() {
+        unsafe { DeleteObject(a.font as _) };
+    }
+    a.font = unsafe { make_font(scale) };
+    let height = a.item_h + a.pad * 2;
+    unsafe { place_and_show(a, cx, cy, height) };
+    a.caret_on = true;
 }
 
 fn relayout(a: &mut App) {
@@ -607,6 +868,7 @@ fn hide_popup(a: &mut App) {
     unsafe { ShowWindow(a.hwnd, SW_HIDE) };
     a.visible = false;
     a.hovered = -1;
+    unsafe { reconcile_input(a) }; // drop the hook again if a keyboard trigger
 }
 
 unsafe fn fill_color(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, color: COLORREF) {
@@ -723,6 +985,25 @@ unsafe fn paint(hwnd: HWND) {
     fill_color(hdc, 0, 0, rc.right, rc.bottom, COL_BG);
     let oldf = SelectObject(hdc, a.font as _);
     SetBkMode(hdc, TRANSPARENT as i32);
+
+    if a.capturing {
+        SetTextColor(hdc, COL_TEXT);
+        let prompt = wide_no_nul("Press a key combo or a mouse button  \u{2014}  Esc to cancel");
+        let mut tr = RECT { left: a.pad * 2, top: 0, right: rc.right - a.pad * 2, bottom: rc.bottom };
+        DrawTextW(
+            hdc,
+            prompt.as_ptr(),
+            prompt.len() as i32,
+            &mut tr,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+        SelectObject(hdc, oldf);
+        let border = CreateSolidBrush(COL_ACCENT);
+        FrameRect(hdc, &rc, border);
+        DeleteObject(border as _);
+        EndPaint(hwnd, &ps);
+        return;
+    }
 
     let text_left = a.pad * 2;
     let text_right = a.width - a.item_h; // reserve the right column for the ✕
@@ -887,7 +1168,210 @@ unsafe fn end_edit(commit: bool) {
     }
 }
 
+// ---- Input plumbing: hook + hotkey lifecycle ------------------------------
+
+/// Install/remove the mouse hook and the keyboard hotkey to match the current
+/// (paused, trigger, visible, capturing) state. This is what makes Pause a
+/// *true* zero-footprint stop, and lets a keyboard trigger leave no mouse hook
+/// installed while idle (so apps like Houdini keep their middle button).
+unsafe fn reconcile_input(a: &mut App) {
+    // The mouse hook is needed for: a mouse trigger, the popup being open
+    // (wheel-scroll + click-away), or capturing a custom trigger.
+    let want_hook = !a.paused && (!a.trigger.is_key() || a.visible || a.capturing);
+    let have_hook = a.hook != 0;
+    if want_hook && !have_hook {
+        a.hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), a.hinst, 0) as isize;
+    } else if !want_hook && have_hook {
+        UnhookWindowsHookEx(a.hook as _);
+        a.hook = 0;
+    }
+
+    let want_hotkey = !a.paused && a.trigger.is_key();
+    if want_hotkey && !a.hotkey_active {
+        if let Trigger::Key { vk, mods } = a.trigger {
+            if RegisterHotKey(a.hwnd, ID_HOTKEY, to_win32_mods(mods) | MOD_NOREPEAT, vk) != 0 {
+                a.hotkey_active = true;
+            }
+        }
+    } else if !want_hotkey && a.hotkey_active {
+        UnregisterHotKey(a.hwnd, ID_HOTKEY);
+        a.hotkey_active = false;
+    }
+}
+
+/// Tell the user a keyboard combo couldn't be claimed (already in use).
+unsafe fn warn_hotkey_taken(hwnd: HWND) {
+    let text = wide("That key combination is already in use by Windows or another app. Pick a different one.");
+    let title = wide("ClipStack");
+    MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+}
+
+/// Switch the active trigger: reconcile hook/hotkey, persist, refresh tooltip.
+/// If a keyboard combo can't be registered (already taken), roll back so we
+/// never persist or leave the user on a dead trigger.
+unsafe fn set_trigger(t: Trigger) {
+    let (hwnd, desc, ok) = {
+        let mut a = app();
+        if a.trigger == t {
+            return;
+        }
+        let prev = a.trigger;
+        a.trigger = t;
+        reconcile_input(&mut *a);
+        if t.is_key() && !a.hotkey_active {
+            a.trigger = prev;
+            reconcile_input(&mut *a);
+            (a.hwnd, prev.describe(), false)
+        } else {
+            (a.hwnd, t.describe(), true)
+        }
+    };
+    update_tray_tip(hwnd, &desc);
+    if ok {
+        save_trigger(t);
+    } else {
+        warn_hotkey_taken(hwnd);
+    }
+}
+
+unsafe fn update_tray_tip(hwnd: HWND, desc: &str) {
+    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_TIP;
+    let tip = wide(&format!("ClipStack \u{2014} {} to open", desc));
+    let n = tip.len().min(nid.szTip.len());
+    nid.szTip[..n].copy_from_slice(&tip[..n]);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+// ---- Custom-trigger capture -----------------------------------------------
+
+/// Pack a Trigger into a message wparam (0 means "cancelled").
+fn encode_trigger(t: Trigger) -> usize {
+    match t {
+        Trigger::Mouse { btn, mods } => {
+            let code = match btn {
+                Btn::Middle => 1,
+                Btn::X1 => 2,
+                Btn::X2 => 3,
+            };
+            ((mods as usize) << 16) | code
+        }
+        Trigger::Key { vk, mods } => (1 << 24) | ((mods as usize) << 16) | (vk as usize & 0xffff),
+    }
+}
+
+fn decode_trigger(w: usize) -> Option<Trigger> {
+    if w == 0 {
+        return None;
+    }
+    let mods = ((w >> 16) & 0xff) as u8;
+    let code = (w & 0xffff) as u32;
+    if (w >> 24) & 0xff == 1 {
+        Some(Trigger::Key { vk: code, mods })
+    } else {
+        let btn = match code {
+            2 => Btn::X1,
+            3 => Btn::X2,
+            _ => Btn::Middle,
+        };
+        Some(Trigger::Mouse { btn, mods })
+    }
+}
+
+/// Begin listening for a custom trigger: show a prompt, take keyboard focus
+/// (for key combos), and ensure the mouse hook is on (for button choices).
+unsafe fn start_capture() {
+    let (hwnd, x, y) = {
+        let mut a = app();
+        if a.capturing {
+            return;
+        }
+        a.target = GetForegroundWindow(); // focus to restore when done
+        a.capturing = true;
+        reconcile_input(&mut *a);
+        let mut pt: POINT = std::mem::zeroed();
+        GetCursorPos(&mut pt);
+        (a.hwnd, pt.x, pt.y)
+    };
+    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !(WS_EX_NOACTIVATE as isize));
+    show_capture_prompt(&mut app(), x, y);
+    SetForegroundWindow(hwnd);
+    SetFocus(hwnd);
+}
+
+/// Finish capture: `Some(t)` applies the new trigger, `None` cancels.
+unsafe fn finish_capture(new: Option<Trigger>) {
+    let (hwnd, restore, desc, failed) = {
+        let mut a = app();
+        if !a.capturing {
+            return;
+        }
+        a.capturing = false;
+        a.caret_on = false;
+        let ex = GetWindowLongPtrW(a.hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(a.hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE as isize);
+        a.visible = false;
+        ShowWindow(a.hwnd, SW_HIDE);
+        let prev = a.trigger;
+        let mut failed = false;
+        if let Some(t) = new {
+            a.trigger = t;
+            reconcile_input(&mut *a);
+            if t.is_key() && !a.hotkey_active {
+                a.trigger = prev; // couldn't register the combo — keep the old one
+                reconcile_input(&mut *a);
+                failed = true;
+            }
+        } else {
+            reconcile_input(&mut *a);
+        }
+        (a.hwnd, a.target, a.trigger.describe(), failed)
+    };
+    if let Some(t) = new {
+        if !failed {
+            save_trigger(t);
+        }
+    }
+    if !restore.is_null() {
+        SetForegroundWindow(restore);
+    }
+    update_tray_tip(hwnd, &desc);
+    if failed {
+        warn_hotkey_taken(hwnd);
+    }
+}
+
 // ---- Low-level mouse hook -------------------------------------------------
+
+/// Does this mouse-down event match the configured mouse trigger?
+fn mouse_event_matches(t: Trigger, msg: u32, mouse_data: u32) -> bool {
+    if let Trigger::Mouse { btn, mods } = t {
+        if cur_mods() != mods {
+            return false; // exact modifier match, so e.g. Ctrl+middle-click isn't
+                          // swallowed by a plain-middle trigger
+        }
+        match btn {
+            Btn::Middle => msg == WM_MBUTTONDOWN,
+            Btn::X1 => msg == WM_XBUTTONDOWN && (mouse_data >> 16) & 0xffff == XBUTTON1 as u32,
+            Btn::X2 => msg == WM_XBUTTONDOWN && (mouse_data >> 16) & 0xffff == XBUTTON2 as u32,
+        }
+    } else {
+        false
+    }
+}
+
+/// The button-up message paired with a given button-down.
+fn up_for(down: u32) -> u32 {
+    if down == WM_XBUTTONDOWN {
+        WM_XBUTTONUP
+    } else {
+        WM_MBUTTONUP
+    }
+}
 
 unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code == HC_ACTION {
@@ -895,15 +1379,51 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         let info = &*(lp as *const MSLLHOOKSTRUCT);
         let pt = info.pt;
         let mut a = app();
+
+        if a.capturing {
+            // Listening for a custom trigger: a non-typing button picks it; a
+            // normal left/right click cancels. Swallow buttons so nothing leaks.
+            match msg {
+                WM_MBUTTONDOWN => {
+                    let t = Trigger::Mouse { btn: Btn::Middle, mods: cur_mods() };
+                    PostMessageW(a.hwnd, WM_APP_CAPTURED, encode_trigger(t), 0);
+                }
+                WM_XBUTTONDOWN => {
+                    let btn = if (info.mouseData >> 16) & 0xffff == XBUTTON2 as u32 {
+                        Btn::X2
+                    } else {
+                        Btn::X1
+                    };
+                    let t = Trigger::Mouse { btn, mods: cur_mods() };
+                    PostMessageW(a.hwnd, WM_APP_CAPTURED, encode_trigger(t), 0);
+                }
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
+                    PostMessageW(a.hwnd, WM_APP_CAPTURED, 0, 0); // cancel
+                }
+                _ => {}
+            }
+            return match msg {
+                WM_MOUSEMOVE | WM_MOUSEWHEEL => CallNextHookEx(null_mut(), code, wp, lp),
+                _ => 1,
+            };
+        }
+
         match msg {
-            WM_MBUTTONDOWN if !a.visible && !a.paused => {
-                a.target = GetForegroundWindow();
-                a.swallow_mup = true;
-                PostMessageW(a.hwnd, WM_APP_SHOW, pt.x as usize, pt.y as isize);
+            m if !a.paused && mouse_event_matches(a.trigger, m, info.mouseData) => {
+                // The trigger button is fully ours: toggle the popup and swallow
+                // both the press and its release so the app never sees it (so a
+                // Back/Forward button stops navigating while it's mapped here).
+                if a.visible {
+                    PostMessageW(a.hwnd, WM_APP_HIDE, 0, 0);
+                } else {
+                    a.target = GetForegroundWindow();
+                    PostMessageW(a.hwnd, WM_APP_SHOW, pt.x as usize, pt.y as isize);
+                }
+                a.swallow_up = Some(up_for(m));
                 return 1;
             }
-            WM_MBUTTONUP if a.swallow_mup => {
-                a.swallow_mup = false;
+            m if a.swallow_up == Some(m) => {
+                a.swallow_up = None;
                 return 1;
             }
             WM_MOUSEWHEEL if a.visible => {
@@ -912,7 +1432,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
                 PostMessageW(a.hwnd, WM_APP_SCROLL, dir, 0);
                 return 1;
             }
-            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN if a.visible => {
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN if a.visible => {
                 let mut r: RECT = std::mem::zeroed();
                 GetWindowRect(a.hwnd, &mut r);
                 let inside = pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
@@ -999,6 +1519,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             InvalidateRect(hwnd, null(), 1);
             0
         }
+        WM_KILLFOCUS => {
+            // We only ever hold focus during capture or inline-edit; if we lose
+            // it (e.g. the user alt-tabs away mid-capture), post a cancel so
+            // capture can't get wedged. It MUST be posted, not handled inline:
+            // WM_KILLFOCUS can arrive synchronously while the App borrow is held
+            // (ShowWindow(SW_HIDE) on the focused window), so touching app() here
+            // would re-borrow and panic. The posted cancel is a no-op unless a
+            // capture is actually in progress.
+            PostMessageW(hwnd, WM_APP_CAPTURED, 0, 0);
+            0
+        }
         WM_LBUTTONUP => {
             if app().edit.is_some() {
                 return 0; // ignore clicks on rows while labeling; Enter/Esc only
@@ -1078,24 +1609,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
-        WM_KEYDOWN => {
-            if app().edit.is_none() {
-                return DefWindowProcW(hwnd, msg, wp, lp);
-            }
-            match wp as u16 {
-                0x1B => end_edit(false), // VK_ESCAPE: cancel
-                0x0D => {
-                    // VK_RETURN: pin only when the trimmed label is non-empty.
-                    let ready = app().edit.as_ref().map_or(false, |e| {
-                        !String::from_utf16_lossy(&e.label).trim().is_empty()
-                    });
-                    if ready {
-                        end_edit(true);
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            if app().capturing {
+                let vk = wp as u32;
+                if vk == 0x1B {
+                    finish_capture(None); // Esc cancels
+                } else if !is_modifier_vk(vk) {
+                    let mods = cur_mods();
+                    if mods != 0 {
+                        finish_capture(Some(Trigger::Key { vk, mods }));
                     }
+                    // bare key (no modifier) is rejected by the guardrail; wait
                 }
-                _ => {}
+                return 0;
             }
-            0
+            if msg == WM_KEYDOWN && app().edit.is_some() {
+                match wp as u16 {
+                    0x1B => end_edit(false), // VK_ESCAPE: cancel
+                    0x0D => {
+                        // VK_RETURN: pin only when the trimmed label is non-empty.
+                        let ready = app().edit.as_ref().map_or(false, |e| {
+                            !String::from_utf16_lossy(&e.label).trim().is_empty()
+                        });
+                        if ready {
+                            end_edit(true);
+                        }
+                    }
+                    _ => {}
+                }
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_CHAR => {
             if app().edit.is_none() {
@@ -1136,6 +1680,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             paint(hwnd);
             0
         }
+        WM_HOTKEY => {
+            let mut a = app();
+            if !a.visible && !a.paused && !a.capturing {
+                a.target = GetForegroundWindow();
+                let mut pt: POINT = std::mem::zeroed();
+                GetCursorPos(&mut pt);
+                show_popup(&mut *a, pt.x, pt.y);
+            }
+            0
+        }
+        WM_APP_CAPTURED => {
+            finish_capture(decode_trigger(wp));
+            0
+        }
         WM_APP_TRAY => {
             let event = (lp as u32) & 0xffff;
             if event == WM_RBUTTONUP || event == WM_CONTEXTMENU || event == WM_LBUTTONUP {
@@ -1146,8 +1704,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_COMMAND => {
             match (wp & 0xffff) as usize {
                 ID_PAUSE => {
-                    let p = !app().paused;
-                    app().paused = p;
+                    let mut a = app();
+                    a.paused = !a.paused;
+                    if a.paused {
+                        hide_popup(&mut *a);
+                    }
+                    reconcile_input(&mut *a); // pause fully removes the hook/hotkey
                 }
                 ID_CLEAR => {
                     let mut a = app();
@@ -1158,6 +1720,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_QUIT => {
                     DestroyWindow(hwnd);
                 }
+                ID_TRIG_MIDDLE => set_trigger(Trigger::MIDDLE),
+                ID_TRIG_MOUSE4 => set_trigger(Trigger::MOUSE4),
+                ID_TRIG_MOUSE5 => set_trigger(Trigger::MOUSE5),
+                ID_TRIG_HOTKEY => set_trigger(Trigger::HOTKEY),
+                ID_TRIG_CUSTOM => start_capture(),
                 _ => {}
             }
             0
@@ -1172,11 +1739,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 unsafe fn show_tray_menu(hwnd: HWND) {
-    let paused = app().paused;
+    let (paused, trigger) = {
+        let a = app();
+        (a.paused, a.trigger)
+    };
     let mut pt: POINT = std::mem::zeroed();
     GetCursorPos(&mut pt);
     let menu = CreatePopupMenu();
-    let pause_label = if paused { wide("Resume middle-click") } else { wide("Pause middle-click") };
+
+    // Trigger submenu, radio-checked on the active choice.
+    let sub = CreatePopupMenu();
+    AppendMenuW(sub, MF_STRING, ID_TRIG_MIDDLE, wide("Middle click").as_ptr());
+    AppendMenuW(sub, MF_STRING, ID_TRIG_MOUSE4, wide("Mouse 4 (back)").as_ptr());
+    AppendMenuW(sub, MF_STRING, ID_TRIG_MOUSE5, wide("Mouse 5 (forward)").as_ptr());
+    AppendMenuW(sub, MF_STRING, ID_TRIG_HOTKEY, wide("Ctrl + Shift + V (keyboard)").as_ptr());
+    AppendMenuW(sub, MF_SEPARATOR, 0, null());
+    let custom_label = if trigger.menu_id() == ID_TRIG_CUSTOM {
+        wide(&format!("Custom: {}", trigger.describe()))
+    } else {
+        wide("Set custom trigger\u{2026}")
+    };
+    AppendMenuW(sub, MF_STRING, ID_TRIG_CUSTOM, custom_label.as_ptr());
+    CheckMenuRadioItem(
+        sub,
+        ID_TRIG_MIDDLE as u32,
+        ID_TRIG_CUSTOM as u32,
+        trigger.menu_id() as u32,
+        MF_BYCOMMAND,
+    );
+    AppendMenuW(menu, MF_POPUP, sub as usize, wide("Trigger").as_ptr());
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+
+    let pause_label = if paused { wide("Resume capture") } else { wide("Pause capture") };
     AppendMenuW(menu, MF_STRING, ID_PAUSE, pause_label.as_ptr());
     AppendMenuW(menu, MF_STRING, ID_CLEAR, wide("Clear history").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
@@ -1214,7 +1808,8 @@ unsafe fn add_tray(hwnd: HWND) {
     let cx = GetSystemMetrics(SM_CXSMICON);
     let cy = GetSystemMetrics(SM_CYSMICON);
     nid.hIcon = load_app_icon(cx, cy);
-    let tip = wide("ClipStack \u{2014} middle-click for clipboard history");
+    let desc = app().trigger.describe();
+    let tip = wide(&format!("ClipStack \u{2014} {} to open", desc));
     let n = tip.len().min(nid.szTip.len());
     nid.szTip[..n].copy_from_slice(&tip[..n]);
     Shell_NotifyIconW(NIM_ADD, &nid);
@@ -1231,6 +1826,10 @@ unsafe fn cleanup(hwnd: HWND) {
     if a.hook != 0 {
         UnhookWindowsHookEx(a.hook as _);
         a.hook = 0;
+    }
+    if a.hotkey_active {
+        UnregisterHotKey(hwnd, ID_HOTKEY);
+        a.hotkey_active = false;
     }
     if !a.font.is_null() {
         DeleteObject(a.font as _);
@@ -1273,9 +1872,11 @@ fn main() {
 
         let clipboard = arboard::Clipboard::new().ok();
         let pins = load_pins();
+        let trigger = load_trigger();
 
         *G.0.borrow_mut() = Some(App {
             hwnd: null_mut(),
+            hinst,
             hook: 0,
             clipboard,
             history: Vec::new(),
@@ -1286,9 +1887,12 @@ fn main() {
             target: null_mut(),
             paused: false,
             visible: false,
+            trigger,
+            hotkey_active: false,
+            capturing: false,
             edit: None,
             caret_on: false,
-            swallow_mup: false,
+            swallow_up: None,
             hovered: -1,
             tracking_leave: false,
             font: null_mut(),
@@ -1320,8 +1924,8 @@ fn main() {
         add_tray(hwnd);
         poll_clip(&mut app()); // seed with whatever's on the clipboard now
 
-        let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), hinst, 0);
-        app().hook = hook as isize;
+        // Install the mouse hook and/or keyboard hotkey for the loaded trigger.
+        reconcile_input(&mut app());
 
         SetTimer(hwnd, TIMER_CLIP, 500, None);
 
