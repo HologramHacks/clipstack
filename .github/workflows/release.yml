@@ -29,7 +29,7 @@ jobs:
         shell: bash
         run: cd target/release && sha256sum clipstack.exe | tee clipstack.exe.sha256
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: target/release/clipstack.exe
       - name: Attach assets to release
