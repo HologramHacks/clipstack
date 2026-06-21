@@ -26,7 +26,7 @@ ClipStack sits in your system tray. Middle-click is the default opener (you can 
 | **Click the ✕** on a row | Removes that clip from history |
 | **Right-click** a clip | Pins it with a label (kept until you remove it) |
 | **Right-click** a pin | Unpins it |
-| **Right-click the tray icon** | Choose the trigger · Launch at startup · Pause capture · Clear history · Quit |
+| **Right-click the tray icon** | Choose the trigger · Launch at startup · Remember history · Pause capture · Clear history · Quit |
 
 ### Changing the trigger
 
@@ -37,6 +37,10 @@ Middle-click is the default, but you can remap it from the tray: **right-click t
 ### Start with Windows
 
 Right-click the tray icon and tick **Launch at startup** to have ClipStack open when you log in. It's **off by default** and just adds a per-user `Run` entry — untick it to remove. (No admin rights, nothing system-wide.)
+
+### Remember history (opt-in)
+
+By default your history is **memory-only** — it vanishes when ClipStack closes. If you'd rather it be there after a reboot or crash (like an editor restoring your tabs), tick **Remember history** in the tray. While it's on, your **text** clips are saved **DPAPI-encrypted** to `%APPDATA%\ClipStack\history.dat` and reloaded on launch; it's flushed continuously, so a crash loses at most the last half-second. It's **off by default** — the trade-off is that copied text (including anything sensitive) then lives on disk, encrypted at rest, until you clear it. Untick it (or **Clear history**) to delete the file. Images stay memory-only either way.
 
 ## What it does
 
@@ -66,7 +70,7 @@ I wanted a clipboard manager that was instant, stayed out of the way, and didn't
 
 ## Security notes
 
-- Clipboard **history lives only in memory** — it is never written to disk, and it is wiped on exit.
+- Clipboard **history lives only in memory by default** — never written to disk, wiped on exit. (The opt-in **Remember history** setting changes this: while it's on, text clips are saved DPAPI-encrypted to `%APPDATA%\ClipStack\history.dat` until you clear them. It's off unless you turn it on.)
 - **Pinned secrets** are encrypted at rest with Windows DPAPI (per-user) in `%APPDATA%\ClipStack\pins.dat`. That protects them on disk, but note the limits: any program running as the *same Windows user* can ask DPAPI to decrypt them, and when you paste a pin it lands on the normal Windows clipboard in cleartext (that's the whole point). So treat it as "encrypted at rest, per user," not "hidden from everything."
 - ClipStack uses a **global mouse hook** (to catch your open shortcut) and **reads the clipboard on a short timer** (that's how history is built) — the same behaviors some malware uses, so an unsigned build may trip a SmartScreen or antivirus warning. It's all local: no keystroke logging, nothing leaves your machine, and the full source is right here to check.
 - Your trigger choice is saved in plaintext at `%APPDATA%\ClipStack\settings.txt` — it's just a key/button name, not a secret.
