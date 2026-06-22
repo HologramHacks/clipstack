@@ -32,9 +32,10 @@ ClipStack sits in your system tray. Middle-click is the default opener (you can 
 | **Mouse wheel** (popup open) | Scrolls through older clips |
 | **Left-click** a row | Copies that clip *and* pastes it into the field you were in |
 | **Click the ✕** on a row | Removes that clip from history |
-| **Hover a clip → click the pin** (or right-click it) | Pins it with a label, masked on screen — up to 8 pins, kept until you remove them |
+| **Hover a clip → click the pin** (or right-click it) | Pins it with a label, masked on screen. Up to 99 pins, kept until you remove them |
+| **Hover a pin → up/down arrows** | Reorder it. Plain click moves one step, Shift+click sends it to the top or bottom |
 | **Right-click** a pin | Unpins it |
-| **Right-click the tray icon** | Trigger · Launch at startup · Remember history · Pause · Clear history · About · GitHub · Quit |
+| **Right-click the tray icon** | Trigger · Launch at startup · Remember history · Auto-copy on highlight · Pause · Clear history · About · Quit |
 
 ### Changing the trigger
 
@@ -48,7 +49,11 @@ Right-click the tray icon and tick **Launch at startup** to have ClipStack open 
 
 ### Remember history (opt-in)
 
-By default your history is **memory-only** — it vanishes when ClipStack closes. If you'd rather it be there after a reboot or crash (like an editor restoring your tabs), tick **Remember history** in the tray. While it's on, your **text** clips are saved **DPAPI-encrypted** to `%APPDATA%\ClipStack\history.dat` and reloaded on launch; it's flushed continuously, so a crash loses at most the last half-second. It's **off by default** — the trade-off is that copied text (including anything sensitive) then lives on disk, encrypted at rest, until you clear it. Untick it (or **Clear history**) to delete the file. Images stay memory-only either way.
+By default your history is **memory-only** — it vanishes when ClipStack closes. If you'd rather it be there after a reboot or crash (like an editor restoring your tabs), tick **Remember history** in the tray. While it's on, your **text** clips are saved **DPAPI-encrypted** to `%LOCALAPPDATA%\ClipStack\history.dat` and reloaded on launch; it's flushed continuously, so a crash loses at most the last half-second. It's **off by default** — the trade-off is that copied text (including anything sensitive) then lives on disk, encrypted at rest, until you clear it. Untick it (or **Clear history**) to delete the file. Images stay memory-only either way.
+
+### Auto-copy on highlight (opt-in)
+
+Tick **Auto-copy on highlight** in the tray and ClipStack copies whatever you select with the mouse the moment you finish the drag, so highlighted text lands in your history without pressing Ctrl+C. It's **off by default**. Heads up: it's a heuristic (any click-drag counts, not just text) and it overwrites your clipboard on every selection, so leave it off unless you specifically want that behavior.
 
 ## What it does
 
@@ -78,10 +83,10 @@ I wanted a clipboard manager that was instant, stayed out of the way, and didn't
 
 ## Security notes
 
-- Clipboard **history lives only in memory by default** — never written to disk, wiped on exit. (The opt-in **Remember history** setting changes this: while it's on, text clips are saved DPAPI-encrypted to `%APPDATA%\ClipStack\history.dat` until you clear them. It's off unless you turn it on.)
-- **Pinned secrets are encrypted in memory *and* at rest.** In RAM they're held encrypted with `CryptProtectMemory` (per-process key) and their pages are locked out of the pagefile (`VirtualLock`); they're decrypted only for the instant you paste them, then the plaintext is wiped. On disk they're DPAPI-encrypted (per-user) in `%APPDATA%\ClipStack\pins.dat`. And when you paste a pin, ClipStack tags the clipboard so Windows keeps it **out of clipboard history (Win+V) and cloud sync** — the way password managers do. Honest limits: a program running as the *same Windows user* can still ask DPAPI to decrypt the file, and pasting a pin necessarily lands it on the Windows clipboard in cleartext for the target app to read (that's the point of pasting). So: encrypted in memory, encrypted at rest, kept out of clipboard history, decrypted only at the moment of use — not hidden from everything.
+- Clipboard **history lives only in memory by default** — never written to disk, wiped on exit. (The opt-in **Remember history** setting changes this: while it's on, text clips are saved DPAPI-encrypted to `%LOCALAPPDATA%\ClipStack\history.dat` until you clear them. It's off unless you turn it on.)
+- **Pinned secrets are encrypted in memory *and* at rest.** In RAM they're held encrypted with `CryptProtectMemory` (per-process key) and their pages are locked out of the pagefile (`VirtualLock`); they're decrypted only for the instant you paste them, then the plaintext is wiped. On disk they're DPAPI-encrypted (per-user) in `%LOCALAPPDATA%\ClipStack\pins.dat`. And when you paste a pin, ClipStack tags the clipboard so Windows keeps it **out of clipboard history (Win+V) and cloud sync** — the way password managers do. Honest limits: a program running as the *same Windows user* can still ask DPAPI to decrypt the file, and pasting a pin necessarily lands it on the Windows clipboard in cleartext for the target app to read (that's the point of pasting). So: encrypted in memory, encrypted at rest, kept out of clipboard history, decrypted only at the moment of use — not hidden from everything.
 - ClipStack uses a **global mouse hook** (to catch your open shortcut) and **reads the clipboard on a short timer** (that's how history is built) — the same behaviors some malware uses, so an unsigned build may trip a SmartScreen or antivirus warning. It's all local: no keystroke logging, nothing leaves your machine, and the full source is right here to check.
-- Your trigger choice is saved in plaintext at `%APPDATA%\ClipStack\settings.txt` — it's just a key/button name, not a secret.
+- Your trigger choice is saved in plaintext at `%LOCALAPPDATA%\ClipStack\settings.txt` — it's just a key/button name, not a secret.
 - **No network, no telemetry, no analytics.** ClipStack never opens a network connection.
 
 ## License
