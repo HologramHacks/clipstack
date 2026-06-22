@@ -81,6 +81,7 @@ const WM_APP_SHOW: u32 = WM_APP + 2; // wparam=x, lparam=y
 const WM_APP_HIDE: u32 = WM_APP + 3;
 const WM_APP_SCROLL: u32 = WM_APP + 4; // wparam: 1=up, 2=down
 const WM_APP_CAPTURED: u32 = WM_APP + 5; // wparam=encoded trigger (0=cancel)
+const WM_APP_AUTOCOPY: u32 = WM_APP + 6; // a drag-release: copy the selection
 
 // Tray menu command ids.
 const ID_PAUSE: usize = 101;
@@ -89,6 +90,7 @@ const ID_QUIT: usize = 103;
 const ID_STARTUP: usize = 104;
 const ID_PERSIST: usize = 105;
 const ID_ABOUT: usize = 106;
+const ID_AUTOCOPY: usize = 107;
 
 // HKCU Run-key entry for the optional "launch at startup" toggle.
 const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -235,6 +237,8 @@ struct App {
     rows: Vec<VRow>,
     scroll: usize,
     pin_scroll: usize,
+    auto_copy: bool,             // opt-in: copy a highlighted selection on drag-release
+    drag_start: Option<POINT>,   // left-button-down point, for the drag heuristic
     target: HWND,
     paused: bool,
     visible: bool,
@@ -987,15 +991,17 @@ fn trigger_line(t: Trigger) -> String {
     }
 }
 
-fn save_settings(trigger: Trigger, persist: bool) {
+fn save_settings(trigger: Trigger, persist: bool, auto_copy: bool) {
     let mut s = trigger_line(trigger);
     s.push_str(if persist { "persist=1\n" } else { "persist=0\n" });
+    s.push_str(if auto_copy { "autocopy=1\n" } else { "autocopy=0\n" });
     let _ = std::fs::write(appdata_file("settings.txt"), s);
 }
 
-fn load_settings() -> (Trigger, bool) {
+fn load_settings() -> (Trigger, bool, bool) {
     let mut trigger = Trigger::MIDDLE;
     let mut persist = false;
+    let mut auto_copy = false;
     if let Ok(text) = std::fs::read_to_string(appdata_file("settings.txt")) {
         for line in text.lines() {
             let line = line.trim();
@@ -1025,10 +1031,12 @@ fn load_settings() -> (Trigger, bool) {
                 }
             } else if let Some(v) = line.strip_prefix("persist=") {
                 persist = v.trim() == "1";
+            } else if let Some(v) = line.strip_prefix("autocopy=") {
+                auto_copy = v.trim() == "1";
             }
         }
     }
-    (trigger, persist)
+    (trigger, persist, auto_copy)
 }
 
 // ---- History persistence (opt-in, DPAPI-encrypted) ------------------------
@@ -1832,6 +1840,19 @@ fn send_paste() {
     }
 }
 
+/// Synthesize Ctrl+C to copy the current selection (used by auto-copy).
+fn send_copy() {
+    let inputs = [
+        key_input(VK_CONTROL, false),
+        key_input(0x43, false), // 'C'
+        key_input(0x43, true),
+        key_input(VK_CONTROL, true),
+    ];
+    unsafe {
+        SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
 // ---- Inline pin labeling --------------------------------------------------
 
 /// Finish an in-progress inline label edit. On `commit` with a non-empty label,
@@ -1876,8 +1897,10 @@ unsafe fn end_edit(commit: bool) {
 /// installed while idle (so apps like Houdini keep their middle button).
 unsafe fn reconcile_input(a: &mut App) {
     // The mouse hook is needed for: a mouse trigger, the popup being open
-    // (wheel-scroll + click-away), or capturing a custom trigger.
-    let want_hook = !a.paused && (!a.trigger.is_key() || a.visible || a.capturing);
+    // (wheel-scroll + click-away), capturing a custom trigger, or auto-copy
+    // (watching for a selection drag while idle).
+    let want_hook =
+        !a.paused && (!a.trigger.is_key() || a.visible || a.capturing || a.auto_copy);
     let have_hook = a.hook != 0;
     if want_hook && !have_hook {
         a.hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), a.hinst, 0) as isize;
@@ -1928,8 +1951,8 @@ unsafe fn set_trigger(t: Trigger) {
     };
     update_tray_tip(hwnd, &desc);
     if ok {
-        let persist = app().persist;
-        save_settings(t, persist);
+        let (persist, auto_copy) = { let a = app(); (a.persist, a.auto_copy) };
+        save_settings(t, persist, auto_copy);
     } else {
         warn_hotkey_taken(hwnd);
     }
@@ -2037,8 +2060,8 @@ unsafe fn finish_capture(new: Option<Trigger>) {
     };
     if let Some(t) = new {
         if !failed {
-            let persist = app().persist;
-            save_settings(t, persist);
+            let (persist, auto_copy) = { let a = app(); (a.persist, a.auto_copy) };
+            save_settings(t, persist, auto_copy);
         }
     }
     if !restore.is_null() {
@@ -2090,6 +2113,22 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
             // event instead of double-borrowing and aborting the process.
             None => return CallNextHookEx(null_mut(), code, wp, lp),
         };
+
+        // Auto-copy on highlight (opt-in, off by default): treat a left-button
+        // drag as a text selection and copy it on release. Heuristic on purpose.
+        if a.auto_copy && !a.visible && !a.capturing && a.edit.is_none() {
+            match msg {
+                WM_LBUTTONDOWN => a.drag_start = Some(pt),
+                WM_LBUTTONUP => {
+                    if let Some(s) = a.drag_start.take() {
+                        if (pt.x - s.x).abs() + (pt.y - s.y).abs() > 6 {
+                            PostMessageW(a.hwnd, WM_APP_AUTOCOPY, 0, 0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
 
         if a.capturing {
             // Listening for a custom trigger: a non-typing button picks it; a
@@ -2167,6 +2206,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_HIDE => {
             hide_popup(&mut app());
+            0
+        }
+        WM_APP_AUTOCOPY => {
+            send_copy(); // copy the just-released selection; the timer poll ingests it
             0
         }
         WM_APP_SCROLL => {
@@ -2488,12 +2531,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_PERSIST => {
                     let mut a = app();
                     a.persist = !a.persist;
-                    save_settings(a.trigger, a.persist);
+                    save_settings(a.trigger, a.persist, a.auto_copy);
                     if a.persist {
                         save_history(&a); // capture what's already in memory
                     } else {
                         clear_history_file(); // stop remembering: delete the file
                     }
+                }
+                ID_AUTOCOPY => {
+                    let mut a = app();
+                    a.auto_copy = !a.auto_copy;
+                    save_settings(a.trigger, a.persist, a.auto_copy);
+                    reconcile_input(&mut a); // install/remove the hook for drag-watching
                 }
                 ID_TRIG_CUSTOM => start_capture(),
                 cmd => {
@@ -2514,9 +2563,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 unsafe fn show_tray_menu(hwnd: HWND) {
-    let (paused, trigger, persist) = {
+    let (paused, trigger, persist, auto_copy) = {
         let a = app();
-        (a.paused, a.trigger, a.persist)
+        (a.paused, a.trigger, a.persist, a.auto_copy)
     };
     let mut pt: POINT = std::mem::zeroed();
     GetCursorPos(&mut pt);
@@ -2552,6 +2601,11 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         persist_flags |= MF_CHECKED;
     }
     AppendMenuW(menu, persist_flags, ID_PERSIST, wide("Remember history").as_ptr());
+    let mut autocopy_flags = MF_STRING;
+    if auto_copy {
+        autocopy_flags |= MF_CHECKED;
+    }
+    AppendMenuW(menu, autocopy_flags, ID_AUTOCOPY, wide("Auto-copy on highlight").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
 
     let pause_label = if paused { wide("Resume capture") } else { wide("Pause capture") };
@@ -2681,7 +2735,7 @@ fn main() {
         }
 
         let pins = load_pins();
-        let (trigger, persist) = load_settings();
+        let (trigger, persist, auto_copy) = load_settings();
         let history = if persist { load_history() } else { Vec::new() };
 
         *G.0.borrow_mut() = Some(App {
@@ -2694,6 +2748,8 @@ fn main() {
             rows: Vec::new(),
             scroll: 0,
             pin_scroll: 0,
+            auto_copy,
+            drag_start: None,
             target: null_mut(),
             paused: false,
             visible: false,
