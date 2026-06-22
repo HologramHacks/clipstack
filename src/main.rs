@@ -88,8 +88,6 @@ const ID_QUIT: usize = 103;
 const ID_STARTUP: usize = 104;
 const ID_PERSIST: usize = 105;
 const ID_ABOUT: usize = 106;
-const ID_WEBSITE: usize = 107;
-const ID_GITHUB: usize = 108;
 
 // HKCU Run-key entry for the optional "launch at startup" toggle.
 const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -2373,8 +2371,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     GetCursorPos(&mut pt);
                     show_about(&mut app(), pt.x, pt.y);
                 }
-                ID_WEBSITE => open_url(hwnd, "https://hologramhacks.com"),
-                ID_GITHUB => open_url(hwnd, "https://github.com/HologramHacks/clipstack"),
                 ID_STARTUP => set_startup(!startup_enabled()),
                 ID_PERSIST => {
                     let mut a = app();
@@ -2451,8 +2447,6 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     let about = format!("About ClipStack v{}", env!("CARGO_PKG_VERSION"));
     AppendMenuW(menu, MF_STRING, ID_ABOUT, wide(&about).as_ptr());
-    AppendMenuW(menu, MF_STRING, ID_WEBSITE, wide("hologramhacks.com").as_ptr());
-    AppendMenuW(menu, MF_STRING, ID_GITHUB, wide("GitHub repo").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_QUIT, wide("Quit ClipStack").as_ptr());
     SetForegroundWindow(hwnd);
