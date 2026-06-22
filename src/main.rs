@@ -275,6 +275,17 @@ fn app() -> RefMut<'static, App> {
     RefMut::map(G.0.borrow_mut(), |o| o.as_mut().expect("App not initialized"))
 }
 
+/// Like `app()` but yields `None` instead of panicking when a borrow is already
+/// held. The low-level mouse hook uses this: Windows can invoke an LL hook
+/// re-entrantly while we are mid-mutation (e.g. during `SetWindowPos` showing
+/// the popup with a mouse move queued), and there we must skip the event rather
+/// than double-borrow and abort the whole process.
+fn try_app() -> Option<RefMut<'static, App>> {
+    G.0.try_borrow_mut()
+        .ok()
+        .map(|g| RefMut::map(g, |o| o.as_mut().expect("App not initialized")))
+}
+
 // ---- Small helpers --------------------------------------------------------
 
 fn wide(s: &str) -> Vec<u16> {
@@ -2036,7 +2047,13 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         let msg = wp as u32;
         let info = &*(lp as *const MSLLHOOKSTRUCT);
         let pt = info.pt;
-        let mut a = app();
+        let mut a = match try_app() {
+            Some(a) => a,
+            // Re-entrant call while the app is already borrowed (Windows can
+            // invoke an LL hook during SetWindowPos and friends). Skip this one
+            // event instead of double-borrowing and aborting the process.
+            None => return CallNextHookEx(null_mut(), code, wp, lp),
+        };
 
         if a.capturing {
             // Listening for a custom trigger: a non-typing button picks it; a
