@@ -57,11 +57,13 @@ Tick **Auto-copy on highlight** in the tray and ClipStack copies whatever you se
 
 ## What it does
 
-- Keeps your last **50 clips** — text *and* images
+- Keeps your last **50 clips** (text *and* images)
+- **Pin up to 99 items.** Reorder by hovering a pin's arrows (Shift+click sends it to the top or bottom), and the block scrolls once it overflows
 - The popup opens right at your cursor and **never steals focus** from what you're doing
-- **Pinned secrets** are masked on screen, **encrypted in memory**, and DPAPI-encrypted on disk — decrypted only for the instant you paste them
-- **No cloud, no network** — your clipboard never leaves your machine
-- **Tiny** — a single ~0.25 MB exe, no runtime, no dependencies
+- **Pinned secrets** are masked on screen, **encrypted in memory**, and DPAPI-encrypted on disk, decrypted only for the instant you paste them
+- **Auto-copy on highlight** (opt-in): grab whatever you select with the mouse, no Ctrl+C needed
+- **No cloud, no network.** Your clipboard never leaves your machine
+- **Tiny:** a single ~0.25 MB exe, no runtime, no dependencies
 
 ## Build from source
 
