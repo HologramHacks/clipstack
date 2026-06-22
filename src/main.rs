@@ -890,13 +890,39 @@ fn unescape(s: &str) -> String {
 /// Path to a per-user file under %APPDATA%\ClipStack, creating the directory
 /// on demand. One builder for pins, settings, and history.
 fn appdata_file(name: &str) -> std::path::PathBuf {
-    let mut p = std::env::var_os("APPDATA")
+    // LOCALAPPDATA (Local), not APPDATA (Roaming): clipboard history and pins are
+    // machine-specific and must not follow the user across machines via a roaming
+    // profile, which made data bleed between a PC and a VM.
+    let mut p = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     p.push("ClipStack");
     let _ = std::fs::create_dir_all(&p);
     p.push(name);
     p
+}
+
+/// One-time copy of data from the old Roaming location to Local. Must run before
+/// anything creates the Local folder, so it only fires on the first launch after
+/// the move, and never clobbers existing Local data.
+fn migrate_from_roaming() {
+    let (Some(roaming), Some(local)) =
+        (std::env::var_os("APPDATA"), std::env::var_os("LOCALAPPDATA"))
+    else {
+        return;
+    };
+    let old = std::path::PathBuf::from(roaming).join("ClipStack");
+    let new = std::path::PathBuf::from(local).join("ClipStack");
+    if new.exists() || !old.exists() {
+        return; // already migrated, or nothing to bring over
+    }
+    let _ = std::fs::create_dir_all(&new);
+    for name in ["pins.dat", "history.dat", "settings.txt"] {
+        let src = old.join(name);
+        if src.exists() {
+            let _ = std::fs::copy(&src, new.join(name));
+        }
+    }
 }
 
 /// DPAPI-encrypt `s` and write it to `path`. Writes nothing if encryption
@@ -1497,16 +1523,26 @@ unsafe fn start_pin(i: usize) {
 }
 
 /// Swap pin `j` with its neighbor (up or down), persist the new order, relayout.
-unsafe fn move_pin(j: usize, up: bool) {
+unsafe fn move_pin(j: usize, up: bool, to_end: bool) {
     let mut a = app();
     let m = a.pins.len();
     if (up && j == 0) || (!up && j + 1 >= m) {
         return; // already at the end in that direction
     }
-    let k = if up { j - 1 } else { j + 1 };
-    a.pins.swap(j, k);
-    if up && k < a.pin_scroll {
-        a.pin_scroll = k; // keep it visible if it floated above the window
+    if to_end {
+        // Shift+click: send all the way to the top or bottom.
+        let p = a.pins.remove(j);
+        let k = if up { 0 } else { a.pins.len() };
+        a.pins.insert(k, p);
+        if up {
+            a.pin_scroll = 0; // show the top so the floated pin is visible
+        }
+    } else {
+        let k = if up { j - 1 } else { j + 1 };
+        a.pins.swap(j, k);
+        if up && k < a.pin_scroll {
+            a.pin_scroll = k; // keep it visible if it floated above the window
+        }
     }
     save_pins(&a);
     relayout(&mut a);
@@ -2254,7 +2290,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             enum Act {
                 Paste(HWND),
                 Pin(usize),
-                MovePin(usize, bool),
+                MovePin(usize, bool, bool),
                 None,
             }
             let act = {
@@ -2279,7 +2315,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             }
                             RowKind::Pin(j) => {
                                 let r = &a.rows[idx];
-                                Act::MovePin(j, y < (r.top + r.bottom) / 2)
+                                let up = y < (r.top + r.bottom) / 2;
+                                Act::MovePin(j, up, cur_mods() & M_SHIFT != 0)
                             }
                             _ => Act::Paste(commit_row(&mut a, idx)),
                         }
@@ -2295,7 +2332,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     send_paste();
                 }
                 Act::Pin(i) => start_pin(i),
-                Act::MovePin(j, up) => move_pin(j, up),
+                Act::MovePin(j, up, to_end) => move_pin(j, up, to_end),
                 _ => {}
             }
             0
@@ -2620,6 +2657,7 @@ fn log_crash(detail: &str) {
 
 fn main() {
     std::panic::set_hook(Box::new(|info| log_crash(&info.to_string())));
+    migrate_from_roaming(); // move data off Roaming before anything reads it
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let hinst = GetModuleHandleW(null());
