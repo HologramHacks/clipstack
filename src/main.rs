@@ -1413,6 +1413,19 @@ unsafe fn draw_updown(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
     DrawTextW(hdc, down.as_ptr(), down.len() as i32, &mut td, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
+/// A super-subtle 2px scroll thumb on the right edge of an overflowing section,
+/// sized and positioned from the visible fraction and scroll offset.
+unsafe fn draw_scroll_thumb(hdc: HDC, width: i32, y0: i32, y1: i32, total: usize, vis: usize, scroll: usize) {
+    if total <= vis {
+        return;
+    }
+    let track = (y1 - y0) as f32;
+    let thumb_h = (track * vis as f32 / total as f32).clamp(14.0, track);
+    let frac = scroll as f32 / (total - vis) as f32;
+    let thumb_y = y0 as f32 + (track - thumb_h) * frac;
+    fill_color(hdc, width - 3, thumb_y as i32, width - 1, (thumb_y + thumb_h) as i32, COL_PIN_BULLET);
+}
+
 /// Width in pixels of `text` in the font currently selected into `hdc`.
 unsafe fn text_width(hdc: HDC, text: &[u16]) -> i32 {
     let mut sz: SIZE = std::mem::zeroed();
@@ -1744,6 +1757,21 @@ unsafe fn paint(hwnd: HWND) {
                     draw_x(hdc, text_right, r.top, a.width, r.bottom);
                 }
             }
+        }
+    }
+
+    if a.history.len() > VISIBLE {
+        let t = a.rows.iter().find(|r| matches!(r.kind, RowKind::Hist(_))).map(|r| r.top);
+        let b = a.rows.iter().rev().find(|r| matches!(r.kind, RowKind::Hist(_))).map(|r| r.bottom);
+        if let (Some(t), Some(b)) = (t, b) {
+            draw_scroll_thumb(hdc, a.width, t, b, a.history.len(), VISIBLE, a.scroll);
+        }
+    }
+    if a.pins.len() > PIN_VISIBLE {
+        let t = a.rows.iter().find(|r| matches!(r.kind, RowKind::Pin(_))).map(|r| r.top);
+        let b = a.rows.iter().rev().find(|r| matches!(r.kind, RowKind::Pin(_))).map(|r| r.bottom);
+        if let (Some(t), Some(b)) = (t, b) {
+            draw_scroll_thumb(hdc, a.width, t, b, a.pins.len(), PIN_VISIBLE, a.pin_scroll);
         }
     }
 
