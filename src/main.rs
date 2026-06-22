@@ -70,8 +70,9 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const MAX_HISTORY: usize = 50;
-const MAX_PINS: usize = 8; // keep the pin list short so the popup stays usable
-const VISIBLE: usize = 15;
+const MAX_PINS: usize = 99; // generous cap; the pin block scrolls past PIN_VISIBLE
+const VISIBLE: usize = 15; // history rows shown before it scrolls
+const PIN_VISIBLE: usize = 8; // pin rows shown before the pin block scrolls
 const SCROLL_STEP: usize = 3;
 
 // Custom window messages.
@@ -233,6 +234,7 @@ struct App {
     last_seq: u32,
     rows: Vec<VRow>,
     scroll: usize,
+    pin_scroll: usize,
     target: HWND,
     paused: bool,
     visible: bool,
@@ -1129,10 +1131,13 @@ fn rebuild_rows(a: &mut App) {
         a.rows.push(VRow { kind: RowKind::Hist(i), top: y, bottom: y + a.item_h });
         y += a.item_h;
     }
-    if !a.pins.is_empty() {
+    let m = a.pins.len();
+    if m > 0 {
         a.rows.push(VRow { kind: RowKind::Sep, top: y, bottom: y + a.sep_h });
         y += a.sep_h;
-        for j in 0..a.pins.len() {
+        let pvis = m.min(PIN_VISIBLE);
+        a.pin_scroll = a.pin_scroll.min(m - pvis); // pvis <= m, so no underflow
+        for j in a.pin_scroll..a.pin_scroll + pvis {
             a.rows.push(VRow { kind: RowKind::Pin(j), top: y, bottom: y + a.item_h });
             y += a.item_h;
         }
@@ -1172,6 +1177,7 @@ fn show_popup(a: &mut App, cx: i32, cy: i32) {
     a.font = unsafe { make_font(scale) };
 
     a.scroll = 0;
+    a.pin_scroll = 0;
     rebuild_rows(a);
     let height = rows_height(a);
 
@@ -1349,6 +1355,19 @@ unsafe fn draw_pin(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, item_
     DeleteObject(f as _);
 }
 
+/// Stacked up/down move arrows (orange) on a hovered pin: click the upper half
+/// to move it up, the lower half to move it down, so favorites float to the top.
+unsafe fn draw_updown(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
+    let mid = (top + bottom) / 2;
+    SetTextColor(hdc, COL_ACCENT);
+    let up = wide_no_nul("\u{25B2}");
+    let mut tr = RECT { left, top, right, bottom: mid };
+    DrawTextW(hdc, up.as_ptr(), up.len() as i32, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    let down = wide_no_nul("\u{25BC}");
+    let mut td = RECT { left, top: mid, right, bottom };
+    DrawTextW(hdc, down.as_ptr(), down.len() as i32, &mut td, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
+
 /// Width in pixels of `text` in the font currently selected into `hdc`.
 unsafe fn text_width(hdc: HDC, text: &[u16]) -> i32 {
     let mut sz: SIZE = std::mem::zeroed();
@@ -1464,6 +1483,22 @@ unsafe fn start_pin(i: usize) {
         a.toast_ticks = 5; // ~2.5s on the 500ms tick
         InvalidateRect(a.hwnd, null(), 0);
     }
+}
+
+/// Swap pin `j` with its neighbor (up or down), persist the new order, relayout.
+unsafe fn move_pin(j: usize, up: bool) {
+    let mut a = app();
+    let m = a.pins.len();
+    if (up && j == 0) || (!up && j + 1 >= m) {
+        return; // already at the end in that direction
+    }
+    let k = if up { j - 1 } else { j + 1 };
+    a.pins.swap(j, k);
+    if up && k < a.pin_scroll {
+        a.pin_scroll = k; // keep it visible if it floated above the window
+    }
+    save_pins(&a);
+    relayout(&mut a);
 }
 
 struct AboutLayout {
@@ -1644,11 +1679,12 @@ unsafe fn paint(hwnd: HWND) {
                 // Dim masked bullets, then the label in bright text after them.
                 let bullets = wide_no_nul(&"\u{2022}".repeat(8));
                 SetTextColor(hdc, COL_PIN_BULLET);
-                draw_text_row(hdc, text_left, r.top, text_right, r.bottom, &bullets);
+                draw_text_row(hdc, text_left, r.top, pin_col, r.bottom, &bullets);
                 let lx = text_left + text_width(hdc, &bullets) + a.pad * 3;
                 SetTextColor(hdc, if hovered { COL_WHITE } else { COL_TEXT });
-                draw_text_row(hdc, lx, r.top, text_right, r.bottom, &wide_no_nul(&a.pins[j].label));
+                draw_text_row(hdc, lx, r.top, pin_col, r.bottom, &wide_no_nul(&a.pins[j].label));
                 if hovered {
+                    draw_updown(hdc, pin_col, r.top, text_right, r.bottom);
                     SetTextColor(hdc, COL_DELETE);
                     draw_x(hdc, text_right, r.top, a.width, r.bottom);
                 }
@@ -2051,7 +2087,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
             WM_MOUSEWHEEL if a.visible => {
                 let delta = ((info.mouseData >> 16) & 0xffff) as u16 as i16;
                 let dir = if delta > 0 { 1usize } else { 2usize };
-                PostMessageW(a.hwnd, WM_APP_SCROLL, dir, 0);
+                PostMessageW(a.hwnd, WM_APP_SCROLL, dir, info.pt.y as isize);
                 return 1;
             }
             WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN if a.visible => {
@@ -2085,10 +2121,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if a.edit.is_some() {
                 return 0; // freeze the list while labeling so indices can't shift
             }
-            let max_scroll = a.history.len().saturating_sub(a.history.len().min(VISIBLE));
-            match wp {
-                1 => a.scroll = a.scroll.saturating_sub(SCROLL_STEP),
-                2 => a.scroll = (a.scroll + SCROLL_STEP).min(max_scroll),
+            // Scroll whichever section the cursor is over: pins (below the
+            // separator) or history (above it).
+            let cy = lp as i32 - a.popup_y;
+            let sep_top = a
+                .rows
+                .iter()
+                .find_map(|r| matches!(r.kind, RowKind::Sep).then_some(r.top));
+            let over_pins = sep_top.is_some_and(|t| cy >= t);
+            match (over_pins, wp) {
+                (true, 1) => a.pin_scroll = a.pin_scroll.saturating_sub(SCROLL_STEP),
+                (true, 2) => {
+                    let m = a.pins.len();
+                    let max = m.saturating_sub(m.min(PIN_VISIBLE));
+                    a.pin_scroll = (a.pin_scroll + SCROLL_STEP).min(max);
+                }
+                (false, 1) => a.scroll = a.scroll.saturating_sub(SCROLL_STEP),
+                (false, 2) => {
+                    let max = a.history.len().saturating_sub(a.history.len().min(VISIBLE));
+                    a.scroll = (a.scroll + SCROLL_STEP).min(max);
+                }
                 _ => {}
             }
             a.hovered = -1;
@@ -2185,6 +2237,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             enum Act {
                 Paste(HWND),
                 Pin(usize),
+                MovePin(usize, bool),
                 None,
             }
             let act = {
@@ -2201,10 +2254,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         Act::None
                     }
                     Some(idx) if x >= a.width - a.item_h * 2 => {
-                        // Clicked the pin affordance — text history rows only.
+                        // The affordance column: text history rows pin here; pin
+                        // rows move up (top half) or down (bottom half).
                         match a.rows[idx].kind {
                             RowKind::Hist(i) if matches!(a.history.get(i), Some(Clip::Text(_))) => {
                                 Act::Pin(i)
+                            }
+                            RowKind::Pin(j) => {
+                                let r = &a.rows[idx];
+                                Act::MovePin(j, y < (r.top + r.bottom) / 2)
                             }
                             _ => Act::Paste(commit_row(&mut a, idx)),
                         }
@@ -2220,6 +2278,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     send_paste();
                 }
                 Act::Pin(i) => start_pin(i),
+                Act::MovePin(j, up) => move_pin(j, up),
                 _ => {}
             }
             0
@@ -2579,6 +2638,7 @@ fn main() {
             last_seq: 0,
             rows: Vec::new(),
             scroll: 0,
+            pin_scroll: 0,
             target: null_mut(),
             paused: false,
             visible: false,
