@@ -30,7 +30,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
-    EndPaint, FillRect, FrameRect, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
+    EndPaint, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
+    ReleaseDC,
     MonitorFromPoint, SelectObject, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor,
     SetWindowRgn, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
     DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
@@ -232,6 +233,9 @@ struct VRow {
 
 struct App {
     hwnd: HWND,
+    tip_hwnd: HWND,    // small dark tooltip window for the hover hints
+    tip_text: String,  // current tooltip text
+    tip_shown: bool,   // whether the tooltip is currently visible
     hinst: windows_sys::Win32::Foundation::HINSTANCE,
     hook: isize, // WH_MOUSE_LL handle, or 0 when not installed
     history: Vec<Clip>,
@@ -1208,6 +1212,71 @@ fn row_at(a: &App, y: i32) -> Option<usize> {
     None
 }
 
+unsafe extern "system" fn tip_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_PAINT {
+        let (text, font) = {
+            let a = app();
+            (wide_no_nul(&a.tip_text), a.font)
+        };
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let mut rc: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut rc);
+        fill_color(hdc, 0, 0, rc.right, rc.bottom, COL_FIELD_BG);
+        let oldf = SelectObject(hdc, font as _);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(hdc, COL_TEXT);
+        DrawTextW(
+            hdc,
+            text.as_ptr(),
+            text.len() as i32,
+            &mut rc,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        SelectObject(hdc, oldf);
+        let border = CreateSolidBrush(COL_ACCENT);
+        FrameRect(hdc, &rc, border);
+        DeleteObject(border as _);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+/// Show the dark hint tooltip with `text`, sitting just left of the cursor.
+unsafe fn show_tip(a: &mut App, text: &str, sx: i32, sy: i32) {
+    if a.tip_hwnd.is_null() {
+        return;
+    }
+    let changed = a.tip_text != text;
+    if changed {
+        a.tip_text = text.to_string();
+    }
+    let w16 = wide_no_nul(text);
+    let dc = GetDC(a.tip_hwnd);
+    let oldf = SelectObject(dc, a.font as _);
+    let mut sz: SIZE = std::mem::zeroed();
+    GetTextExtentPoint32W(dc, w16.as_ptr(), w16.len() as i32, &mut sz);
+    SelectObject(dc, oldf);
+    ReleaseDC(a.tip_hwnd, dc);
+    let w = sz.cx + a.pad * 4;
+    let h = a.item_h;
+    let x = (sx - w - a.pad * 2).max(0);
+    let y = (sy - h / 2).max(0);
+    SetWindowPos(a.tip_hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if changed || !a.tip_shown {
+        InvalidateRect(a.tip_hwnd, null(), 1);
+    }
+    a.tip_shown = true;
+}
+
+unsafe fn hide_tip(a: &mut App) {
+    if a.tip_shown {
+        ShowWindow(a.tip_hwnd, SW_HIDE);
+        a.tip_shown = false;
+    }
+}
+
 fn show_popup(a: &mut App, cx: i32, cy: i32) {
     if a.history.is_empty() && a.pins.is_empty() {
         return;
@@ -1350,7 +1419,10 @@ fn hide_popup(a: &mut App) {
     a.caret_on = false;
     a.about = false;
     a.toast = None;
-    unsafe { ShowWindow(a.hwnd, SW_HIDE) };
+    unsafe {
+        hide_tip(a);
+        ShowWindow(a.hwnd, SW_HIDE)
+    };
     a.visible = false;
     a.hovered = -1;
     unsafe { reconcile_input(a) }; // drop the hook again if a keyboard trigger
@@ -2346,7 +2418,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if a.edit.is_some() {
                 return 0; // no hover changes while a label field is open
             }
-            let (_x, y) = lo_hi(lp);
+            let (x, y) = lo_hi(lp);
             if !a.tracking_leave {
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -2362,12 +2434,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 a.hovered = row;
                 InvalidateRect(hwnd, null(), 1);
             }
+            // Tooltip: hint the reorder gesture when hovering a pin's arrows.
+            let over_arrows = !a.about
+                && row >= 0
+                && matches!(a.rows[row as usize].kind, RowKind::Pin(_))
+                && x >= a.width - a.item_h * 2
+                && x < a.width - a.item_h;
+            if over_arrows {
+                let (sx, sy) = (a.popup_x + x, a.popup_y + y);
+                show_tip(&mut a, "Click to move, Shift+click for top/bottom", sx, sy);
+            } else {
+                hide_tip(&mut a);
+            }
             0
         }
         WM_MOUSELEAVE => {
             let mut a = app();
             a.hovered = -1;
             a.tracking_leave = false;
+            hide_tip(&mut a);
             InvalidateRect(hwnd, null(), 1);
             0
         }
@@ -2831,6 +2916,9 @@ fn main() {
 
         *G.0.borrow_mut() = Some(App {
             hwnd: null_mut(),
+            tip_hwnd: null_mut(),
+            tip_text: String::new(),
+            tip_shown: false,
             hinst,
             hook: 0,
             history,
@@ -2882,6 +2970,39 @@ fn main() {
             null(),
         );
         app().hwnd = hwnd;
+
+        // Tooltip window: a small dark popup for the hover hints.
+        let tip_class = wide("ClipStackTip");
+        {
+            let wc = WNDCLASSW {
+                style: CS_DROPSHADOW,
+                lpfnWndProc: Some(tip_wndproc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: hinst,
+                hIcon: null_mut(),
+                hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+                hbrBackground: null_mut(),
+                lpszMenuName: null(),
+                lpszClassName: tip_class.as_ptr(),
+            };
+            RegisterClassW(&wc);
+        }
+        let tip_hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            tip_class.as_ptr(),
+            wide("").as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            10,
+            10,
+            null_mut(),
+            null_mut(),
+            hinst,
+            null(),
+        );
+        app().tip_hwnd = tip_hwnd;
 
         add_tray(hwnd);
         poll_clip(&mut app()); // seed with whatever's on the clipboard now
