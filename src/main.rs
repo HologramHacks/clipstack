@@ -41,6 +41,9 @@ use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptProtectMemory, CryptUnprotectData, CryptUnprotectMemory,
     CRYPTPROTECTMEMORY_SAME_PROCESS, CRYPT_INTEGER_BLOB,
 };
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    AddVectoredExceptionHandler, RtlCaptureStackBackTrace, EXCEPTION_POINTERS,
+};
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, VirtualLock, VirtualUnlock, GMEM_MOVEABLE,
 };
@@ -1360,12 +1363,50 @@ unsafe fn fill_color(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, col
     DeleteObject(b as _);
 }
 
+/// A malformed clip (control characters, line/paragraph separators, lone UTF-16
+/// surrogates, or an absurd length) can crash DrawTextW deep inside USER32's
+/// text engine. Build a safe, capped copy for anything we render in a row. A row
+/// only ever shows one ellipsized line, so capping well above the visible width
+/// loses nothing.
+fn safe_row_text(text: &[u16]) -> Vec<u16> {
+    let mut out = Vec::with_capacity(text.len().min(256));
+    let mut i = 0;
+    while i < text.len() && out.len() < 256 {
+        let c = text[i];
+        if (0xD800..=0xDBFF).contains(&c) {
+            // High surrogate: keep only if a low surrogate follows.
+            if i + 1 < text.len() && (0xDC00..=0xDFFF).contains(&text[i + 1]) {
+                out.push(c);
+                out.push(text[i + 1]);
+                i += 2;
+                continue;
+            }
+            out.push(0xFFFD);
+        } else if (0xDC00..=0xDFFF).contains(&c) {
+            out.push(0xFFFD); // lone low surrogate
+        } else if c < 0x20 || c == 0x7F || c == 0x0085 || c == 0x2028 || c == 0x2029 {
+            out.push(0x20); // control chars + line/paragraph separators
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
 unsafe fn draw_text_row(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, text: &[u16]) {
+    let safe = safe_row_text(text);
+    if safe.is_empty() {
+        // Nothing to draw. Critically, an empty Vec's as_ptr() is a dangling
+        // pointer, and DrawTextW with DT_END_ELLIPSIS dereferences the buffer
+        // even for a zero count, which faults. An empty clip thus crashed paint.
+        return;
+    }
     let mut tr = RECT { left, top, right, bottom };
     DrawTextW(
         hdc,
-        text.as_ptr(),
-        text.len() as i32,
+        safe.as_ptr(),
+        safe.len() as i32,
         &mut tr,
         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
     );
@@ -2737,10 +2778,32 @@ fn log_crash(detail: &str) {
     }
 }
 
+/// First-chance vectored handler: on an access violation, log the faulting
+/// address and a raw stack backtrace as offsets from the clipstack module base,
+/// then let the crash proceed (resolve the offsets later with `addr2line -e`).
+/// This catches hard faults the Rust panic hook cannot see, including ones that
+/// occur inside a window-procedure callback.
+unsafe extern "system" fn crash_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
+    let rec = (*info).ExceptionRecord;
+    if (*rec).ExceptionCode as u32 == 0xC0000005 {
+        let base = GetModuleHandleW(null()) as usize;
+        let mut frames = [null_mut::<core::ffi::c_void>(); 48];
+        let n = RtlCaptureStackBackTrace(0, 48, frames.as_mut_ptr(), null_mut());
+        let fault = ((*rec).ExceptionAddress as usize).wrapping_sub(base);
+        let mut s = format!("ACCESS_VIOLATION at clipstack+{fault:#x}\n");
+        for f in frames.iter().take(n as usize) {
+            s.push_str(&format!("  +{:#x}\n", (*f as usize).wrapping_sub(base)));
+        }
+        log_crash(&s);
+    }
+    0 // EXCEPTION_CONTINUE_SEARCH
+}
+
 fn main() {
     std::panic::set_hook(Box::new(|info| log_crash(&info.to_string())));
     migrate_from_roaming(); // move data off Roaming before anything reads it
     unsafe {
+        AddVectoredExceptionHandler(1, Some(crash_veh)); // capture hard-fault stacks
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let hinst = GetModuleHandleW(null());
 
