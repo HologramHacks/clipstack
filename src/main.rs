@@ -2524,7 +2524,26 @@ unsafe fn cleanup(hwnd: HWND) {
     }
 }
 
+/// Append a line to %APPDATA%\ClipStack\crash.log. With panic=abort the process
+/// dies silently, so the panic hook routes the panic message and its file:line
+/// here, turning an intermittent crash into a readable breadcrumb.
+fn log_crash(detail: &str) {
+    use std::io::Write;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let line = format!("[{secs}] v{}: {detail}\n", env!("CARGO_PKG_VERSION"));
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(appdata_file("crash.log"))
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 fn main() {
+    std::panic::set_hook(Box::new(|info| log_crash(&info.to_string())));
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let hinst = GetModuleHandleW(null());
