@@ -316,7 +316,7 @@ const COL_BG: COLORREF = rgb(0x1c, 0x1f, 0x26); // window background
 const COL_TEXT: COLORREF = rgb(0xe8, 0xe8, 0xea); // primary text
 const COL_DIM: COLORREF = rgb(0x8a, 0x8f, 0x99); // secondary text (image dims, placeholder)
 const COL_HOVER_BG: COLORREF = rgb(0x26, 0x2b, 0x34); // hovered row tint
-const COL_ACCENT: COLORREF = rgb(0xff, 0x7a, 0x33); // orange accent (from the icon)
+const COL_ACCENT: COLORREF = rgb(0x40, 0xcc, 0x7a); // green accent (from the brand icon)
 const COL_SEP: COLORREF = rgb(0x2e, 0x33, 0x3d); // separators + frame
 const COL_PIN_BULLET: COLORREF = rgb(0x6b, 0x72, 0x80); // masked pin bullets
 const COL_DELETE: COLORREF = rgb(0xff, 0x6b, 0x6b); // hovered-row ✕ delete glyph
@@ -1496,7 +1496,7 @@ unsafe fn draw_x(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
     );
 }
 
-/// Orange pushpin (Segoe MDL2) shown on a hovered text row so it's obvious you
+/// Green pushpin (Segoe MDL2) shown on a hovered text row so it's obvious you
 /// can pin it — mirrors draw_x, but in the icon font and sized to the row.
 unsafe fn draw_pin(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, item_h: i32) {
     let face = wide("Segoe MDL2 Assets");
@@ -1513,7 +1513,7 @@ unsafe fn draw_pin(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, item_
     DeleteObject(f as _);
 }
 
-/// Stacked up/down move arrows (orange) on a hovered pin: click the upper half
+/// Stacked up/down move arrows (green) on a hovered pin: click the upper half
 /// to move it up, the lower half to move it down, so favorites float to the top.
 unsafe fn draw_updown(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
     let mid = (top + bottom) / 2;
@@ -1891,7 +1891,7 @@ unsafe fn paint(hwnd: HWND) {
     if let Some(msg) = &a.toast {
         let top = rc.bottom - a.item_h;
         fill_color(hdc, 0, top, rc.right, rc.bottom, COL_FIELD_BG);
-        fill_color(hdc, 0, top, rc.right, top + 1, COL_ACCENT); // thin orange divider
+        fill_color(hdc, 0, top, rc.right, top + 1, COL_ACCENT); // thin green divider
         SetTextColor(hdc, COL_ACCENT);
         let w = wide_no_nul(msg);
         let mut tr = RECT { left: a.pad * 2, top, right: rc.right - a.pad * 2, bottom: rc.bottom };
