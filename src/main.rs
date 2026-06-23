@@ -30,7 +30,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
-    EndPaint, FillRect, FrameRect, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
+    EndPaint, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
+    ReleaseDC,
     MonitorFromPoint, SelectObject, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor,
     SetWindowRgn, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
     DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
@@ -40,6 +41,9 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptProtectMemory, CryptUnprotectData, CryptUnprotectMemory,
     CRYPTPROTECTMEMORY_SAME_PROCESS, CRYPT_INTEGER_BLOB,
+};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    AddVectoredExceptionHandler, RtlCaptureStackBackTrace, EXCEPTION_POINTERS,
 };
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, VirtualLock, VirtualUnlock, GMEM_MOVEABLE,
@@ -70,8 +74,9 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const MAX_HISTORY: usize = 50;
-const MAX_PINS: usize = 8; // keep the pin list short so the popup stays usable
-const VISIBLE: usize = 15;
+const MAX_PINS: usize = 99; // generous cap; the pin block scrolls past PIN_VISIBLE
+const VISIBLE: usize = 15; // history rows shown before it scrolls
+const PIN_VISIBLE: usize = 8; // pin rows shown before the pin block scrolls
 const SCROLL_STEP: usize = 3;
 
 // Custom window messages.
@@ -80,6 +85,7 @@ const WM_APP_SHOW: u32 = WM_APP + 2; // wparam=x, lparam=y
 const WM_APP_HIDE: u32 = WM_APP + 3;
 const WM_APP_SCROLL: u32 = WM_APP + 4; // wparam: 1=up, 2=down
 const WM_APP_CAPTURED: u32 = WM_APP + 5; // wparam=encoded trigger (0=cancel)
+const WM_APP_AUTOCOPY: u32 = WM_APP + 6; // a drag-release: copy the selection
 
 // Tray menu command ids.
 const ID_PAUSE: usize = 101;
@@ -88,6 +94,7 @@ const ID_QUIT: usize = 103;
 const ID_STARTUP: usize = 104;
 const ID_PERSIST: usize = 105;
 const ID_ABOUT: usize = 106;
+const ID_AUTOCOPY: usize = 107;
 
 // HKCU Run-key entry for the optional "launch at startup" toggle.
 const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -226,6 +233,9 @@ struct VRow {
 
 struct App {
     hwnd: HWND,
+    tip_hwnd: HWND,    // small dark tooltip window for the hover hints
+    tip_text: String,  // current tooltip text
+    tip_shown: bool,   // whether the tooltip is currently visible
     hinst: windows_sys::Win32::Foundation::HINSTANCE,
     hook: isize, // WH_MOUSE_LL handle, or 0 when not installed
     history: Vec<Clip>,
@@ -233,6 +243,9 @@ struct App {
     last_seq: u32,
     rows: Vec<VRow>,
     scroll: usize,
+    pin_scroll: usize,
+    auto_copy: bool,             // opt-in: copy a highlighted selection on drag-release
+    drag_start: Option<POINT>,   // left-button-down point, for the drag heuristic
     target: HWND,
     paused: bool,
     visible: bool,
@@ -271,6 +284,17 @@ static G: Global = Global(RefCell::new(None));
 /// aliases.
 fn app() -> RefMut<'static, App> {
     RefMut::map(G.0.borrow_mut(), |o| o.as_mut().expect("App not initialized"))
+}
+
+/// Like `app()` but yields `None` instead of panicking when a borrow is already
+/// held. The low-level mouse hook uses this: Windows can invoke an LL hook
+/// re-entrantly while we are mid-mutation (e.g. during `SetWindowPos` showing
+/// the popup with a mouse move queued), and there we must skip the event rather
+/// than double-borrow and abort the whole process.
+fn try_app() -> Option<RefMut<'static, App>> {
+    G.0.try_borrow_mut()
+        .ok()
+        .map(|g| RefMut::map(g, |o| o.as_mut().expect("App not initialized")))
 }
 
 // ---- Small helpers --------------------------------------------------------
@@ -877,13 +901,39 @@ fn unescape(s: &str) -> String {
 /// Path to a per-user file under %APPDATA%\ClipStack, creating the directory
 /// on demand. One builder for pins, settings, and history.
 fn appdata_file(name: &str) -> std::path::PathBuf {
-    let mut p = std::env::var_os("APPDATA")
+    // LOCALAPPDATA (Local), not APPDATA (Roaming): clipboard history and pins are
+    // machine-specific and must not follow the user across machines via a roaming
+    // profile, which made data bleed between a PC and a VM.
+    let mut p = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     p.push("ClipStack");
     let _ = std::fs::create_dir_all(&p);
     p.push(name);
     p
+}
+
+/// One-time copy of data from the old Roaming location to Local. Must run before
+/// anything creates the Local folder, so it only fires on the first launch after
+/// the move, and never clobbers existing Local data.
+fn migrate_from_roaming() {
+    let (Some(roaming), Some(local)) =
+        (std::env::var_os("APPDATA"), std::env::var_os("LOCALAPPDATA"))
+    else {
+        return;
+    };
+    let old = std::path::PathBuf::from(roaming).join("ClipStack");
+    let new = std::path::PathBuf::from(local).join("ClipStack");
+    if new.exists() || !old.exists() {
+        return; // already migrated, or nothing to bring over
+    }
+    let _ = std::fs::create_dir_all(&new);
+    for name in ["pins.dat", "history.dat", "settings.txt"] {
+        let src = old.join(name);
+        if src.exists() {
+            let _ = std::fs::copy(&src, new.join(name));
+        }
+    }
 }
 
 /// DPAPI-encrypt `s` and write it to `path`. Writes nothing if encryption
@@ -948,15 +998,17 @@ fn trigger_line(t: Trigger) -> String {
     }
 }
 
-fn save_settings(trigger: Trigger, persist: bool) {
+fn save_settings(trigger: Trigger, persist: bool, auto_copy: bool) {
     let mut s = trigger_line(trigger);
     s.push_str(if persist { "persist=1\n" } else { "persist=0\n" });
+    s.push_str(if auto_copy { "autocopy=1\n" } else { "autocopy=0\n" });
     let _ = std::fs::write(appdata_file("settings.txt"), s);
 }
 
-fn load_settings() -> (Trigger, bool) {
+fn load_settings() -> (Trigger, bool, bool) {
     let mut trigger = Trigger::MIDDLE;
     let mut persist = false;
+    let mut auto_copy = false;
     if let Ok(text) = std::fs::read_to_string(appdata_file("settings.txt")) {
         for line in text.lines() {
             let line = line.trim();
@@ -986,10 +1038,12 @@ fn load_settings() -> (Trigger, bool) {
                 }
             } else if let Some(v) = line.strip_prefix("persist=") {
                 persist = v.trim() == "1";
+            } else if let Some(v) = line.strip_prefix("autocopy=") {
+                auto_copy = v.trim() == "1";
             }
         }
     }
-    (trigger, persist)
+    (trigger, persist, auto_copy)
 }
 
 // ---- History persistence (opt-in, DPAPI-encrypted) ------------------------
@@ -1129,10 +1183,13 @@ fn rebuild_rows(a: &mut App) {
         a.rows.push(VRow { kind: RowKind::Hist(i), top: y, bottom: y + a.item_h });
         y += a.item_h;
     }
-    if !a.pins.is_empty() {
+    let m = a.pins.len();
+    if m > 0 {
         a.rows.push(VRow { kind: RowKind::Sep, top: y, bottom: y + a.sep_h });
         y += a.sep_h;
-        for j in 0..a.pins.len() {
+        let pvis = m.min(PIN_VISIBLE);
+        a.pin_scroll = a.pin_scroll.min(m - pvis); // pvis <= m, so no underflow
+        for j in a.pin_scroll..a.pin_scroll + pvis {
             a.rows.push(VRow { kind: RowKind::Pin(j), top: y, bottom: y + a.item_h });
             y += a.item_h;
         }
@@ -1155,6 +1212,71 @@ fn row_at(a: &App, y: i32) -> Option<usize> {
     None
 }
 
+unsafe extern "system" fn tip_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_PAINT {
+        let (text, font) = {
+            let a = app();
+            (wide_no_nul(&a.tip_text), a.font)
+        };
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let mut rc: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut rc);
+        fill_color(hdc, 0, 0, rc.right, rc.bottom, COL_FIELD_BG);
+        let oldf = SelectObject(hdc, font as _);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(hdc, COL_TEXT);
+        DrawTextW(
+            hdc,
+            text.as_ptr(),
+            text.len() as i32,
+            &mut rc,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        SelectObject(hdc, oldf);
+        let border = CreateSolidBrush(COL_ACCENT);
+        FrameRect(hdc, &rc, border);
+        DeleteObject(border as _);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+/// Show the dark hint tooltip with `text`, sitting just left of the cursor.
+unsafe fn show_tip(a: &mut App, text: &str, sx: i32, sy: i32) {
+    if a.tip_hwnd.is_null() {
+        return;
+    }
+    let changed = a.tip_text != text;
+    if changed {
+        a.tip_text = text.to_string();
+    }
+    let w16 = wide_no_nul(text);
+    let dc = GetDC(a.tip_hwnd);
+    let oldf = SelectObject(dc, a.font as _);
+    let mut sz: SIZE = std::mem::zeroed();
+    GetTextExtentPoint32W(dc, w16.as_ptr(), w16.len() as i32, &mut sz);
+    SelectObject(dc, oldf);
+    ReleaseDC(a.tip_hwnd, dc);
+    let w = sz.cx + a.pad * 4;
+    let h = a.item_h;
+    let x = (sx - w - a.pad * 2).max(0);
+    let y = (sy - h / 2).max(0);
+    SetWindowPos(a.tip_hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if changed || !a.tip_shown {
+        InvalidateRect(a.tip_hwnd, null(), 1);
+    }
+    a.tip_shown = true;
+}
+
+unsafe fn hide_tip(a: &mut App) {
+    if a.tip_shown {
+        ShowWindow(a.tip_hwnd, SW_HIDE);
+        a.tip_shown = false;
+    }
+}
+
 fn show_popup(a: &mut App, cx: i32, cy: i32) {
     if a.history.is_empty() && a.pins.is_empty() {
         return;
@@ -1172,6 +1294,7 @@ fn show_popup(a: &mut App, cx: i32, cy: i32) {
     a.font = unsafe { make_font(scale) };
 
     a.scroll = 0;
+    a.pin_scroll = 0;
     rebuild_rows(a);
     let height = rows_height(a);
 
@@ -1296,7 +1419,10 @@ fn hide_popup(a: &mut App) {
     a.caret_on = false;
     a.about = false;
     a.toast = None;
-    unsafe { ShowWindow(a.hwnd, SW_HIDE) };
+    unsafe {
+        hide_tip(a);
+        ShowWindow(a.hwnd, SW_HIDE)
+    };
     a.visible = false;
     a.hovered = -1;
     unsafe { reconcile_input(a) }; // drop the hook again if a keyboard trigger
@@ -1309,12 +1435,50 @@ unsafe fn fill_color(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, col
     DeleteObject(b as _);
 }
 
+/// A malformed clip (control characters, line/paragraph separators, lone UTF-16
+/// surrogates, or an absurd length) can crash DrawTextW deep inside USER32's
+/// text engine. Build a safe, capped copy for anything we render in a row. A row
+/// only ever shows one ellipsized line, so capping well above the visible width
+/// loses nothing.
+fn safe_row_text(text: &[u16]) -> Vec<u16> {
+    let mut out = Vec::with_capacity(text.len().min(256));
+    let mut i = 0;
+    while i < text.len() && out.len() < 256 {
+        let c = text[i];
+        if (0xD800..=0xDBFF).contains(&c) {
+            // High surrogate: keep only if a low surrogate follows.
+            if i + 1 < text.len() && (0xDC00..=0xDFFF).contains(&text[i + 1]) {
+                out.push(c);
+                out.push(text[i + 1]);
+                i += 2;
+                continue;
+            }
+            out.push(0xFFFD);
+        } else if (0xDC00..=0xDFFF).contains(&c) {
+            out.push(0xFFFD); // lone low surrogate
+        } else if c < 0x20 || c == 0x7F || c == 0x0085 || c == 0x2028 || c == 0x2029 {
+            out.push(0x20); // control chars + line/paragraph separators
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
 unsafe fn draw_text_row(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, text: &[u16]) {
+    let safe = safe_row_text(text);
+    if safe.is_empty() {
+        // Nothing to draw. Critically, an empty Vec's as_ptr() is a dangling
+        // pointer, and DrawTextW with DT_END_ELLIPSIS dereferences the buffer
+        // even for a zero count, which faults. An empty clip thus crashed paint.
+        return;
+    }
     let mut tr = RECT { left, top, right, bottom };
     DrawTextW(
         hdc,
-        text.as_ptr(),
-        text.len() as i32,
+        safe.as_ptr(),
+        safe.len() as i32,
         &mut tr,
         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
     );
@@ -1347,6 +1511,32 @@ unsafe fn draw_pin(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, item_
     DrawTextW(hdc, glyph.as_ptr(), glyph.len() as i32, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(hdc, old);
     DeleteObject(f as _);
+}
+
+/// Stacked up/down move arrows (orange) on a hovered pin: click the upper half
+/// to move it up, the lower half to move it down, so favorites float to the top.
+unsafe fn draw_updown(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
+    let mid = (top + bottom) / 2;
+    SetTextColor(hdc, COL_ACCENT);
+    let up = wide_no_nul("\u{25B2}");
+    let mut tr = RECT { left, top, right, bottom: mid };
+    DrawTextW(hdc, up.as_ptr(), up.len() as i32, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    let down = wide_no_nul("\u{25BC}");
+    let mut td = RECT { left, top: mid, right, bottom };
+    DrawTextW(hdc, down.as_ptr(), down.len() as i32, &mut td, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
+
+/// A super-subtle 2px scroll thumb on the right edge of an overflowing section,
+/// sized and positioned from the visible fraction and scroll offset.
+unsafe fn draw_scroll_thumb(hdc: HDC, width: i32, y0: i32, y1: i32, total: usize, vis: usize, scroll: usize) {
+    if total <= vis {
+        return;
+    }
+    let track = (y1 - y0) as f32;
+    let thumb_h = (track * vis as f32 / total as f32).clamp(14.0, track);
+    let frac = scroll as f32 / (total - vis) as f32;
+    let thumb_y = y0 as f32 + (track - thumb_h) * frac;
+    fill_color(hdc, width - 3, thumb_y as i32, width - 1, (thumb_y + thumb_h) as i32, COL_PIN_BULLET);
 }
 
 /// Width in pixels of `text` in the font currently selected into `hdc`.
@@ -1464,6 +1654,32 @@ unsafe fn start_pin(i: usize) {
         a.toast_ticks = 5; // ~2.5s on the 500ms tick
         InvalidateRect(a.hwnd, null(), 0);
     }
+}
+
+/// Swap pin `j` with its neighbor (up or down), persist the new order, relayout.
+unsafe fn move_pin(j: usize, up: bool, to_end: bool) {
+    let mut a = app();
+    let m = a.pins.len();
+    if (up && j == 0) || (!up && j + 1 >= m) {
+        return; // already at the end in that direction
+    }
+    if to_end {
+        // Shift+click: send all the way to the top or bottom.
+        let p = a.pins.remove(j);
+        let k = if up { 0 } else { a.pins.len() };
+        a.pins.insert(k, p);
+        if up {
+            a.pin_scroll = 0; // show the top so the floated pin is visible
+        }
+    } else {
+        let k = if up { j - 1 } else { j + 1 };
+        a.pins.swap(j, k);
+        if up && k < a.pin_scroll {
+            a.pin_scroll = k; // keep it visible if it floated above the window
+        }
+    }
+    save_pins(&a);
+    relayout(&mut a);
 }
 
 struct AboutLayout {
@@ -1644,15 +1860,31 @@ unsafe fn paint(hwnd: HWND) {
                 // Dim masked bullets, then the label in bright text after them.
                 let bullets = wide_no_nul(&"\u{2022}".repeat(8));
                 SetTextColor(hdc, COL_PIN_BULLET);
-                draw_text_row(hdc, text_left, r.top, text_right, r.bottom, &bullets);
+                draw_text_row(hdc, text_left, r.top, pin_col, r.bottom, &bullets);
                 let lx = text_left + text_width(hdc, &bullets) + a.pad * 3;
                 SetTextColor(hdc, if hovered { COL_WHITE } else { COL_TEXT });
-                draw_text_row(hdc, lx, r.top, text_right, r.bottom, &wide_no_nul(&a.pins[j].label));
+                draw_text_row(hdc, lx, r.top, pin_col, r.bottom, &wide_no_nul(&a.pins[j].label));
                 if hovered {
+                    draw_updown(hdc, pin_col, r.top, text_right, r.bottom);
                     SetTextColor(hdc, COL_DELETE);
                     draw_x(hdc, text_right, r.top, a.width, r.bottom);
                 }
             }
+        }
+    }
+
+    if a.history.len() > VISIBLE {
+        let t = a.rows.iter().find(|r| matches!(r.kind, RowKind::Hist(_))).map(|r| r.top);
+        let b = a.rows.iter().rev().find(|r| matches!(r.kind, RowKind::Hist(_))).map(|r| r.bottom);
+        if let (Some(t), Some(b)) = (t, b) {
+            draw_scroll_thumb(hdc, a.width, t, b, a.history.len(), VISIBLE, a.scroll);
+        }
+    }
+    if a.pins.len() > PIN_VISIBLE {
+        let t = a.rows.iter().find(|r| matches!(r.kind, RowKind::Pin(_))).map(|r| r.top);
+        let b = a.rows.iter().rev().find(|r| matches!(r.kind, RowKind::Pin(_))).map(|r| r.bottom);
+        if let (Some(t), Some(b)) = (t, b) {
+            draw_scroll_thumb(hdc, a.width, t, b, a.pins.len(), PIN_VISIBLE, a.pin_scroll);
         }
     }
 
@@ -1749,6 +1981,19 @@ fn send_paste() {
     }
 }
 
+/// Synthesize Ctrl+C to copy the current selection (used by auto-copy).
+fn send_copy() {
+    let inputs = [
+        key_input(VK_CONTROL, false),
+        key_input(0x43, false), // 'C'
+        key_input(0x43, true),
+        key_input(VK_CONTROL, true),
+    ];
+    unsafe {
+        SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
 // ---- Inline pin labeling --------------------------------------------------
 
 /// Finish an in-progress inline label edit. On `commit` with a non-empty label,
@@ -1793,8 +2038,10 @@ unsafe fn end_edit(commit: bool) {
 /// installed while idle (so apps like Houdini keep their middle button).
 unsafe fn reconcile_input(a: &mut App) {
     // The mouse hook is needed for: a mouse trigger, the popup being open
-    // (wheel-scroll + click-away), or capturing a custom trigger.
-    let want_hook = !a.paused && (!a.trigger.is_key() || a.visible || a.capturing);
+    // (wheel-scroll + click-away), capturing a custom trigger, or auto-copy
+    // (watching for a selection drag while idle).
+    let want_hook =
+        !a.paused && (!a.trigger.is_key() || a.visible || a.capturing || a.auto_copy);
     let have_hook = a.hook != 0;
     if want_hook && !have_hook {
         a.hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), a.hinst, 0) as isize;
@@ -1845,8 +2092,8 @@ unsafe fn set_trigger(t: Trigger) {
     };
     update_tray_tip(hwnd, &desc);
     if ok {
-        let persist = app().persist;
-        save_settings(t, persist);
+        let (persist, auto_copy) = { let a = app(); (a.persist, a.auto_copy) };
+        save_settings(t, persist, auto_copy);
     } else {
         warn_hotkey_taken(hwnd);
     }
@@ -1954,8 +2201,8 @@ unsafe fn finish_capture(new: Option<Trigger>) {
     };
     if let Some(t) = new {
         if !failed {
-            let persist = app().persist;
-            save_settings(t, persist);
+            let (persist, auto_copy) = { let a = app(); (a.persist, a.auto_copy) };
+            save_settings(t, persist, auto_copy);
         }
     }
     if !restore.is_null() {
@@ -2000,7 +2247,29 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         let msg = wp as u32;
         let info = &*(lp as *const MSLLHOOKSTRUCT);
         let pt = info.pt;
-        let mut a = app();
+        let mut a = match try_app() {
+            Some(a) => a,
+            // Re-entrant call while the app is already borrowed (Windows can
+            // invoke an LL hook during SetWindowPos and friends). Skip this one
+            // event instead of double-borrowing and aborting the process.
+            None => return CallNextHookEx(null_mut(), code, wp, lp),
+        };
+
+        // Auto-copy on highlight (opt-in, off by default): treat a left-button
+        // drag as a text selection and copy it on release. Heuristic on purpose.
+        if a.auto_copy && !a.visible && !a.capturing && a.edit.is_none() {
+            match msg {
+                WM_LBUTTONDOWN => a.drag_start = Some(pt),
+                WM_LBUTTONUP => {
+                    if let Some(s) = a.drag_start.take() {
+                        if (pt.x - s.x).abs() + (pt.y - s.y).abs() > 6 {
+                            PostMessageW(a.hwnd, WM_APP_AUTOCOPY, 0, 0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
 
         if a.capturing {
             // Listening for a custom trigger: a non-typing button picks it; a
@@ -2051,7 +2320,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
             WM_MOUSEWHEEL if a.visible => {
                 let delta = ((info.mouseData >> 16) & 0xffff) as u16 as i16;
                 let dir = if delta > 0 { 1usize } else { 2usize };
-                PostMessageW(a.hwnd, WM_APP_SCROLL, dir, 0);
+                PostMessageW(a.hwnd, WM_APP_SCROLL, dir, info.pt.y as isize);
                 return 1;
             }
             WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN if a.visible => {
@@ -2080,15 +2349,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             hide_popup(&mut app());
             0
         }
+        WM_APP_AUTOCOPY => {
+            send_copy(); // copy the just-released selection; the timer poll ingests it
+            0
+        }
         WM_APP_SCROLL => {
             let mut a = app();
             if a.edit.is_some() {
                 return 0; // freeze the list while labeling so indices can't shift
             }
-            let max_scroll = a.history.len().saturating_sub(a.history.len().min(VISIBLE));
-            match wp {
-                1 => a.scroll = a.scroll.saturating_sub(SCROLL_STEP),
-                2 => a.scroll = (a.scroll + SCROLL_STEP).min(max_scroll),
+            // Scroll whichever section the cursor is over: pins (below the
+            // separator) or history (above it).
+            let cy = lp as i32 - a.popup_y;
+            let sep_top = a
+                .rows
+                .iter()
+                .find_map(|r| matches!(r.kind, RowKind::Sep).then_some(r.top));
+            let over_pins = sep_top.is_some_and(|t| cy >= t);
+            match (over_pins, wp) {
+                (true, 1) => a.pin_scroll = a.pin_scroll.saturating_sub(SCROLL_STEP),
+                (true, 2) => {
+                    let m = a.pins.len();
+                    let max = m.saturating_sub(m.min(PIN_VISIBLE));
+                    a.pin_scroll = (a.pin_scroll + SCROLL_STEP).min(max);
+                }
+                (false, 1) => a.scroll = a.scroll.saturating_sub(SCROLL_STEP),
+                (false, 2) => {
+                    let max = a.history.len().saturating_sub(a.history.len().min(VISIBLE));
+                    a.scroll = (a.scroll + SCROLL_STEP).min(max);
+                }
                 _ => {}
             }
             a.hovered = -1;
@@ -2129,7 +2418,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if a.edit.is_some() {
                 return 0; // no hover changes while a label field is open
             }
-            let (_x, y) = lo_hi(lp);
+            let (x, y) = lo_hi(lp);
             if !a.tracking_leave {
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -2145,12 +2434,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 a.hovered = row;
                 InvalidateRect(hwnd, null(), 1);
             }
+            // Tooltip: hint the reorder gesture when hovering a pin's arrows.
+            let over_arrows = !a.about
+                && row >= 0
+                && matches!(a.rows[row as usize].kind, RowKind::Pin(_))
+                && x >= a.width - a.item_h * 2
+                && x < a.width - a.item_h;
+            if over_arrows {
+                let (sx, sy) = (a.popup_x + x, a.popup_y + y);
+                show_tip(&mut a, "Click to move, Shift+click for top/bottom", sx, sy);
+            } else {
+                hide_tip(&mut a);
+            }
             0
         }
         WM_MOUSELEAVE => {
             let mut a = app();
             a.hovered = -1;
             a.tracking_leave = false;
+            hide_tip(&mut a);
             InvalidateRect(hwnd, null(), 1);
             0
         }
@@ -2185,6 +2487,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             enum Act {
                 Paste(HWND),
                 Pin(usize),
+                MovePin(usize, bool, bool),
                 None,
             }
             let act = {
@@ -2201,10 +2504,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         Act::None
                     }
                     Some(idx) if x >= a.width - a.item_h * 2 => {
-                        // Clicked the pin affordance — text history rows only.
+                        // The affordance column: text history rows pin here; pin
+                        // rows move up (top half) or down (bottom half).
                         match a.rows[idx].kind {
                             RowKind::Hist(i) if matches!(a.history.get(i), Some(Clip::Text(_))) => {
                                 Act::Pin(i)
+                            }
+                            RowKind::Pin(j) => {
+                                let r = &a.rows[idx];
+                                let up = y < (r.top + r.bottom) / 2;
+                                Act::MovePin(j, up, cur_mods() & M_SHIFT != 0)
                             }
                             _ => Act::Paste(commit_row(&mut a, idx)),
                         }
@@ -2220,6 +2529,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     send_paste();
                 }
                 Act::Pin(i) => start_pin(i),
+                Act::MovePin(j, up, to_end) => move_pin(j, up, to_end),
                 _ => {}
             }
             0
@@ -2375,12 +2685,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_PERSIST => {
                     let mut a = app();
                     a.persist = !a.persist;
-                    save_settings(a.trigger, a.persist);
+                    save_settings(a.trigger, a.persist, a.auto_copy);
                     if a.persist {
                         save_history(&a); // capture what's already in memory
                     } else {
                         clear_history_file(); // stop remembering: delete the file
                     }
+                }
+                ID_AUTOCOPY => {
+                    let mut a = app();
+                    a.auto_copy = !a.auto_copy;
+                    save_settings(a.trigger, a.persist, a.auto_copy);
+                    reconcile_input(&mut a); // install/remove the hook for drag-watching
                 }
                 ID_TRIG_CUSTOM => start_capture(),
                 cmd => {
@@ -2401,9 +2717,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 unsafe fn show_tray_menu(hwnd: HWND) {
-    let (paused, trigger, persist) = {
+    let (paused, trigger, persist, auto_copy) = {
         let a = app();
-        (a.paused, a.trigger, a.persist)
+        (a.paused, a.trigger, a.persist, a.auto_copy)
     };
     let mut pt: POINT = std::mem::zeroed();
     GetCursorPos(&mut pt);
@@ -2439,6 +2755,11 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         persist_flags |= MF_CHECKED;
     }
     AppendMenuW(menu, persist_flags, ID_PERSIST, wide("Remember history").as_ptr());
+    let mut autocopy_flags = MF_STRING;
+    if auto_copy {
+        autocopy_flags |= MF_CHECKED;
+    }
+    AppendMenuW(menu, autocopy_flags, ID_AUTOCOPY, wide("Auto-copy on highlight").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
 
     let pause_label = if paused { wide("Resume capture") } else { wide("Pause capture") };
@@ -2524,8 +2845,50 @@ unsafe fn cleanup(hwnd: HWND) {
     }
 }
 
+/// Append a line to %APPDATA%\ClipStack\crash.log. With panic=abort the process
+/// dies silently, so the panic hook routes the panic message and its file:line
+/// here, turning an intermittent crash into a readable breadcrumb.
+fn log_crash(detail: &str) {
+    use std::io::Write;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let line = format!("[{secs}] v{}: {detail}\n", env!("CARGO_PKG_VERSION"));
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(appdata_file("crash.log"))
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// First-chance vectored handler: on an access violation, log the faulting
+/// address and a raw stack backtrace as offsets from the clipstack module base,
+/// then let the crash proceed (resolve the offsets later with `addr2line -e`).
+/// This catches hard faults the Rust panic hook cannot see, including ones that
+/// occur inside a window-procedure callback.
+unsafe extern "system" fn crash_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
+    let rec = (*info).ExceptionRecord;
+    if (*rec).ExceptionCode as u32 == 0xC0000005 {
+        let base = GetModuleHandleW(null()) as usize;
+        let mut frames = [null_mut::<core::ffi::c_void>(); 48];
+        let n = RtlCaptureStackBackTrace(0, 48, frames.as_mut_ptr(), null_mut());
+        let fault = ((*rec).ExceptionAddress as usize).wrapping_sub(base);
+        let mut s = format!("ACCESS_VIOLATION at clipstack+{fault:#x}\n");
+        for f in frames.iter().take(n as usize) {
+            s.push_str(&format!("  +{:#x}\n", (*f as usize).wrapping_sub(base)));
+        }
+        log_crash(&s);
+    }
+    0 // EXCEPTION_CONTINUE_SEARCH
+}
+
 fn main() {
+    std::panic::set_hook(Box::new(|info| log_crash(&info.to_string())));
+    migrate_from_roaming(); // move data off Roaming before anything reads it
     unsafe {
+        AddVectoredExceptionHandler(1, Some(crash_veh)); // capture hard-fault stacks
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let hinst = GetModuleHandleW(null());
 
@@ -2548,11 +2911,14 @@ fn main() {
         }
 
         let pins = load_pins();
-        let (trigger, persist) = load_settings();
+        let (trigger, persist, auto_copy) = load_settings();
         let history = if persist { load_history() } else { Vec::new() };
 
         *G.0.borrow_mut() = Some(App {
             hwnd: null_mut(),
+            tip_hwnd: null_mut(),
+            tip_text: String::new(),
+            tip_shown: false,
             hinst,
             hook: 0,
             history,
@@ -2560,6 +2926,9 @@ fn main() {
             last_seq: 0,
             rows: Vec::new(),
             scroll: 0,
+            pin_scroll: 0,
+            auto_copy,
+            drag_start: None,
             target: null_mut(),
             paused: false,
             visible: false,
@@ -2601,6 +2970,39 @@ fn main() {
             null(),
         );
         app().hwnd = hwnd;
+
+        // Tooltip window: a small dark popup for the hover hints.
+        let tip_class = wide("ClipStackTip");
+        {
+            let wc = WNDCLASSW {
+                style: CS_DROPSHADOW,
+                lpfnWndProc: Some(tip_wndproc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: hinst,
+                hIcon: null_mut(),
+                hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+                hbrBackground: null_mut(),
+                lpszMenuName: null(),
+                lpszClassName: tip_class.as_ptr(),
+            };
+            RegisterClassW(&wc);
+        }
+        let tip_hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            tip_class.as_ptr(),
+            wide("").as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            10,
+            10,
+            null_mut(),
+            null_mut(),
+            hinst,
+            null(),
+        );
+        app().tip_hwnd = tip_hwnd;
 
         add_tray(hwnd);
         poll_clip(&mut app()); // seed with whatever's on the clipboard now

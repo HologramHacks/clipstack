@@ -1,6 +1,6 @@
 [package]
 name = "clipstack"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Tiny clipboard history popup for Windows (configurable trigger)"
 
@@ -18,6 +18,8 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
     "Win32_System_Registry",
     "Win32_Security_Cryptography",
     "Win32_UI_HiDpi",
