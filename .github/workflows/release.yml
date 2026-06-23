@@ -32,9 +32,15 @@ jobs:
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: target/release/clipstack.exe
+      - name: Build release notes from the tag annotation
+        shell: bash
+        run: |
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > RELEASE_NOTES.md
+          printf '\n## Install\nDownload `clipstack.exe` below and run it. Single file, no installer, no runtime, lives in your tray. Unsigned, so on first launch click **More info, then Run anyway**.\n\nVerify the download (optional): `gh attestation verify clipstack.exe --repo HologramHacks/clipstack`\n' >> RELEASE_NOTES.md
       - name: Attach assets to release
         uses: softprops/action-gh-release@v3
         with:
+          body_path: RELEASE_NOTES.md
           files: |
             target/release/clipstack.exe
             target/release/clipstack.exe.sha256
