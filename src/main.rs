@@ -900,38 +900,69 @@ fn unescape(s: &str) -> String {
 
 /// Path to a per-user file under %APPDATA%\ClipStack, creating the directory
 /// on demand. One builder for pins, settings, and history.
+/// A filesystem-safe per-machine folder name from the computer name. Clipboard
+/// data is machine-specific, but a roaming profile, or a VM whose AppData is
+/// mapped to the host's, can make even %LOCALAPPDATA% shared between two machines.
+/// Keying the data folder on the computer name keeps each machine's data separate
+/// even inside a shared folder.
+fn machine_id() -> String {
+    let safe: String = std::env::var("COMPUTERNAME")
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if safe.is_empty() {
+        "default".into()
+    } else {
+        safe
+    }
+}
+
 fn appdata_file(name: &str) -> std::path::PathBuf {
-    // LOCALAPPDATA (Local), not APPDATA (Roaming): clipboard history and pins are
-    // machine-specific and must not follow the user across machines via a roaming
-    // profile, which made data bleed between a PC and a VM.
+    // LOCALAPPDATA\ClipStack\<machine>\: Local (not Roaming) because clipboard data
+    // is machine-specific, plus a per-machine subfolder so a shared or VM-mapped
+    // AppData cannot bleed one machine's pins/history into another's.
     let mut p = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     p.push("ClipStack");
+    p.push(machine_id());
     let _ = std::fs::create_dir_all(&p);
     p.push(name);
     p
 }
 
-/// One-time copy of data from the old Roaming location to Local. Must run before
-/// anything creates the Local folder, so it only fires on the first launch after
-/// the move, and never clobbers existing Local data.
-fn migrate_from_roaming() {
-    let (Some(roaming), Some(local)) =
-        (std::env::var_os("APPDATA"), std::env::var_os("LOCALAPPDATA"))
-    else {
+/// One-time copy of existing data into this machine's per-machine folder. Pulls
+/// from the old flat Local\ClipStack first, then the older Roaming\ClipStack, so
+/// upgrades keep their pins/history. Copies rather than moves, so a second machine
+/// sharing the folder can still find the source for its own migration.
+fn migrate_data() {
+    let Some(local) = std::env::var_os("LOCALAPPDATA") else {
         return;
     };
-    let old = std::path::PathBuf::from(roaming).join("ClipStack");
-    let new = std::path::PathBuf::from(local).join("ClipStack");
-    if new.exists() || !old.exists() {
-        return; // already migrated, or nothing to bring over
+    let base = std::path::PathBuf::from(local).join("ClipStack");
+    let dest = base.join(machine_id());
+    let names = ["pins.dat", "history.dat", "settings.txt"];
+    let has = |dir: &std::path::Path| names.iter().any(|n| dir.join(n).exists());
+    if has(&dest) {
+        return; // this machine already has its own data
     }
-    let _ = std::fs::create_dir_all(&new);
-    for name in ["pins.dat", "history.dat", "settings.txt"] {
-        let src = old.join(name);
-        if src.exists() {
-            let _ = std::fs::copy(&src, new.join(name));
+    // Source: the old flat Local folder, else the even older Roaming folder.
+    let mut src = base.clone();
+    if !has(&src) {
+        match std::env::var_os("APPDATA") {
+            Some(r) => src = std::path::PathBuf::from(r).join("ClipStack"),
+            None => return,
+        }
+    }
+    if !has(&src) {
+        return; // nothing to bring over; fresh start
+    }
+    let _ = std::fs::create_dir_all(&dest);
+    for name in names {
+        let s = src.join(name);
+        if s.exists() {
+            let _ = std::fs::copy(&s, dest.join(name));
         }
     }
 }
@@ -2886,7 +2917,7 @@ unsafe extern "system" fn crash_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
 
 fn main() {
     std::panic::set_hook(Box::new(|info| log_crash(&info.to_string())));
-    migrate_from_roaming(); // move data off Roaming before anything reads it
+    migrate_data(); // pull existing data into this machine's per-machine folder
     unsafe {
         AddVectoredExceptionHandler(1, Some(crash_veh)); // capture hard-fault stacks
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
