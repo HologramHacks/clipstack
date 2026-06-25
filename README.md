@@ -30,11 +30,12 @@ ClipStack sits in your system tray. Middle-click is the default opener (you can 
 |---|---|
 | **Middle-click** anywhere | Opens the history popup at your cursor |
 | **Mouse wheel** (popup open) | Scrolls through older clips |
-| **Left-click** a row | Copies that clip *and* pastes it into the field you were in |
-| **Click the ✕** on a row | Removes that clip from history |
-| **Hover a clip → click the pin** (or right-click it) | Pins it with a label, masked on screen. Up to 99 pins, kept until you remove them (a pin's ✕ takes two clicks to confirm) |
-| **Hover a pin → up/down arrows** | Reorder it. Plain click moves one step, Shift+click sends it to the top or bottom |
-| **Right-click** a pin | Unpins it |
+| **Left-click** a row | Pastes that clip (or pin) into the field you were in |
+| **Click the ✕** on a history clip | Removes it from history (one click) |
+| **Hover a text clip → click the green pin** (or right-click the clip) | Pins it with a label you type, masked on screen. Up to 99 pins |
+| **Right-click** a pin | Renames it (edit the label inline) |
+| **Hover a pin → up/down arrows** | Reorders it: plain click moves one step, Shift+click sends it to the top or bottom |
+| **Click a pin's ✕, then click again** | Deletes the pin. The first click arms a red confirm button so you can't delete by accident |
 | **Right-click the tray icon** | Trigger · Theme (6 of them) · Launch at startup · Remember history · Auto-copy on highlight · Pause · Clear history · About · Quit |
 
 ### Changing the trigger

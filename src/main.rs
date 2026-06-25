@@ -152,10 +152,11 @@ struct Pin {
 /// history row renders as a text field and the popup briefly holds keyboard
 /// focus so it can receive WM_CHAR.
 struct Edit {
-    hist: usize,     // history index being labeled
-    secret: String,  // the clip text that will become the pin's secret
-    label: Vec<u16>, // label typed so far (UTF-16, no NUL)
-    restore: HWND,   // foreground window to hand focus back to when done
+    hist: usize,           // history index being labeled (unused when renaming)
+    secret: String,        // the clip text that will become the pin's secret
+    label: Vec<u16>,       // label typed so far (UTF-16, no NUL)
+    restore: HWND,         // foreground window to hand focus back to when done
+    rename: Option<usize>, // Some(j) = renaming existing pin j; None = new pin from history
 }
 
 /// A non-typing mouse button usable as a trigger.
@@ -1780,7 +1781,7 @@ unsafe fn start_pin(i: usize) {
                 _ => unreachable!(),
             };
             let restore = a.target;
-            a.edit = Some(Edit { hist: i, secret, label: Vec::new(), restore });
+            a.edit = Some(Edit { hist: i, secret, label: Vec::new(), restore, rename: None });
             a.caret_on = true;
             (Some(a.hwnd), false)
         }
@@ -1794,9 +1795,38 @@ unsafe fn start_pin(i: usize) {
         InvalidateRect(hwnd2, null(), 1);
     } else if capped {
         let mut a = app();
-        a.toast = Some(format!("Pin limit reached ({MAX_PINS}) \u{2014} unpin one first"));
+        a.toast = Some(format!("Pin limit reached ({MAX_PINS}), unpin one first"));
         a.toast_ticks = 5; // ~2.5s on the 500ms tick
         InvalidateRect(a.hwnd, null(), 0);
+    }
+}
+
+/// Right-click an existing pin to rename it: open the inline editor pre-filled
+/// with the current label. Enter saves the new name, Esc or click-away cancels.
+unsafe fn start_rename(j: usize) {
+    let start = {
+        let mut a = app();
+        if j >= a.pins.len() {
+            None
+        } else {
+            let label: Vec<u16> = a.pins[j].label.encode_utf16().collect();
+            let restore = a.target;
+            a.edit = Some(Edit {
+                hist: 0,
+                secret: String::new(),
+                label,
+                restore,
+                rename: Some(j),
+            });
+            a.caret_on = true;
+            Some(a.hwnd)
+        }
+    };
+    if let Some(hwnd2) = start {
+        set_no_activate(hwnd2, false);
+        SetForegroundWindow(hwnd2);
+        SetFocus(hwnd2);
+        InvalidateRect(hwnd2, null(), 1);
     }
 }
 
@@ -1997,6 +2027,10 @@ unsafe fn paint(hwnd: HWND) {
                 }
             }
             RowKind::Pin(j) => {
+                if a.edit.as_ref().is_some_and(|e| e.rename == Some(j)) {
+                    paint_edit_row(hdc, &a, r, text_left);
+                    continue;
+                }
                 if hovered {
                     fill_color(hdc, 0, r.top, a.width, r.bottom, theme().hover_bg);
                     fill_color(hdc, 0, r.top, bar_w, r.bottom, theme().accent);
@@ -2160,11 +2194,19 @@ unsafe fn end_edit(commit: bool) {
         if commit {
             let label = String::from_utf16_lossy(&ed.label).trim().to_string();
             if !label.is_empty() {
-                let mut secret = std::mem::take(&mut ed.secret);
-                let (secret_enc, len) = protect_secret(&secret);
-                scrub_string(&mut secret);
-                a.pins.push(Pin { label, secret_enc, len });
-                save_pins(&a);
+                if let Some(j) = ed.rename {
+                    // Renaming an existing pin: only the label changes.
+                    if let Some(p) = a.pins.get_mut(j) {
+                        p.label = label;
+                        save_pins(&a);
+                    }
+                } else {
+                    let mut secret = std::mem::take(&mut ed.secret);
+                    let (secret_enc, len) = protect_secret(&secret);
+                    scrub_string(&mut secret);
+                    a.pins.push(Pin { label, secret_enc, len });
+                    save_pins(&a);
+                }
             }
         }
         scrub_string(&mut ed.secret); // no-op if the secret was moved into the pin
@@ -2709,13 +2751,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 row_at(&a, y).map(|idx| a.rows[idx].kind)
             };
             match kind {
-                Some(RowKind::Pin(j)) => {
-                    let mut a = app();
-                    let mut p = a.pins.remove(j);
-                    scrub_pin(&mut p);
-                    save_pins(&a);
-                    relayout(&mut a);
-                }
+                Some(RowKind::Pin(j)) => start_rename(j),
                 Some(RowKind::Hist(i)) => start_pin(i),
                 _ => {}
             }
