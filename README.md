@@ -32,10 +32,10 @@ ClipStack sits in your system tray. Middle-click is the default opener (you can 
 | **Mouse wheel** (popup open) | Scrolls through older clips |
 | **Left-click** a row | Copies that clip *and* pastes it into the field you were in |
 | **Click the ✕** on a row | Removes that clip from history |
-| **Hover a clip → click the pin** (or right-click it) | Pins it with a label, masked on screen. Up to 99 pins, kept until you remove them |
+| **Hover a clip → click the pin** (or right-click it) | Pins it with a label, masked on screen. Up to 99 pins, kept until you remove them (a pin's ✕ takes two clicks to confirm) |
 | **Hover a pin → up/down arrows** | Reorder it. Plain click moves one step, Shift+click sends it to the top or bottom |
 | **Right-click** a pin | Unpins it |
-| **Right-click the tray icon** | Trigger · Launch at startup · Remember history · Auto-copy on highlight · Pause · Clear history · About · Quit |
+| **Right-click the tray icon** | Trigger · Theme (6 of them) · Launch at startup · Remember history · Auto-copy on highlight · Pause · Clear history · About · Quit |
 
 ### Changing the trigger
 
@@ -62,6 +62,7 @@ Tick **Auto-copy on highlight** in the tray and ClipStack copies whatever you se
 - The popup opens right at your cursor and **never steals focus** from what you're doing
 - **Pinned secrets** are masked on screen, **encrypted in memory**, and DPAPI-encrypted on disk, decrypted only for the instant you paste them
 - **Auto-copy on highlight** (opt-in): grab whatever you select with the mouse, no Ctrl+C needed
+- **Six color themes** (Dark, Grey, Light, Nord, Solarized, High Contrast) in the tray, dark by default
 - **No cloud, no network.** Your clipboard never leaves your machine
 - **Tiny:** a single ~0.25 MB exe, no runtime, no dependencies
 

@@ -95,6 +95,7 @@ const ID_STARTUP: usize = 104;
 const ID_PERSIST: usize = 105;
 const ID_ABOUT: usize = 106;
 const ID_AUTOCOPY: usize = 107;
+const ID_THEME_BASE: usize = 300; // themes occupy ID_THEME_BASE .. ID_THEME_BASE + THEMES.len()
 
 // HKCU Run-key entry for the optional "launch at startup" toggle.
 const RUN_SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -246,6 +247,8 @@ struct App {
     pin_scroll: usize,
     auto_copy: bool,             // opt-in: copy a highlighted selection on drag-release
     drag_start: Option<POINT>,   // left-button-down point, for the drag heuristic
+    theme_idx: usize,            // index into THEMES
+    arm_delete: i32,             // pin row index whose delete is armed (one-click confirm), or -1
     target: HWND,
     paused: bool,
     visible: bool,
@@ -312,16 +315,116 @@ const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
 }
 
 // Dark command-palette palette.
-const COL_BG: COLORREF = rgb(0x1c, 0x1f, 0x26); // window background
-const COL_TEXT: COLORREF = rgb(0xe8, 0xe8, 0xea); // primary text
-const COL_DIM: COLORREF = rgb(0x8a, 0x8f, 0x99); // secondary text (image dims, placeholder)
-const COL_HOVER_BG: COLORREF = rgb(0x26, 0x2b, 0x34); // hovered row tint
-const COL_ACCENT: COLORREF = rgb(0x40, 0xcc, 0x7a); // green accent (from the brand icon)
-const COL_SEP: COLORREF = rgb(0x2e, 0x33, 0x3d); // separators + frame
-const COL_PIN_BULLET: COLORREF = rgb(0x6b, 0x72, 0x80); // masked pin bullets
-const COL_DELETE: COLORREF = rgb(0xff, 0x6b, 0x6b); // hovered-row ✕ delete glyph
-const COL_FIELD_BG: COLORREF = rgb(0x13, 0x16, 0x1b); // inline label input background
-const COL_WHITE: COLORREF = rgb(255, 255, 255); // bright text on a highlighted/active row
+/// A full color palette. Swapping the active one repaints the whole UI.
+#[derive(Clone, Copy)]
+struct Theme {
+    bg: COLORREF,         // window background
+    text: COLORREF,       // primary text
+    dim: COLORREF,        // secondary text (image dims, placeholder)
+    hover_bg: COLORREF,   // hovered row tint
+    accent: COLORREF,     // brand accent (pins, arrows, links, divider, frame)
+    sep: COLORREF,        // separators
+    pin_bullet: COLORREF, // masked pin bullets
+    delete: COLORREF,     // hovered-row delete glyph
+    field_bg: COLORREF,   // inline label input background
+    strong: COLORREF,     // emphasized text on a hovered/active row
+}
+
+const THEME_DARK: Theme = Theme {
+    bg: rgb(0x1c, 0x1f, 0x26),
+    text: rgb(0xe8, 0xe8, 0xea),
+    dim: rgb(0x8a, 0x8f, 0x99),
+    hover_bg: rgb(0x26, 0x2b, 0x34),
+    accent: rgb(0x40, 0xcc, 0x7a),
+    sep: rgb(0x2e, 0x33, 0x3d),
+    pin_bullet: rgb(0x6b, 0x72, 0x80),
+    delete: rgb(0xff, 0x6b, 0x6b),
+    field_bg: rgb(0x13, 0x16, 0x1b),
+    strong: rgb(0xff, 0xff, 0xff),
+};
+const THEME_GREY: Theme = Theme {
+    bg: rgb(0xc4, 0xc8, 0xcd),
+    text: rgb(0x1a, 0x1c, 0x20),
+    dim: rgb(0x55, 0x5a, 0x62),
+    hover_bg: rgb(0xb0, 0xb5, 0xbb),
+    accent: rgb(0x1f, 0x9e, 0x55),
+    sep: rgb(0x9a, 0x9f, 0xa6),
+    pin_bullet: rgb(0x6b, 0x72, 0x80),
+    delete: rgb(0xcf, 0x32, 0x32),
+    field_bg: rgb(0xda, 0xdd, 0xe1),
+    strong: rgb(0x00, 0x00, 0x00),
+};
+const THEME_LIGHT: Theme = Theme {
+    bg: rgb(0xf5, 0xf6, 0xf8),
+    text: rgb(0x1a, 0x1c, 0x22),
+    dim: rgb(0x6a, 0x70, 0x78),
+    hover_bg: rgb(0xe6, 0xe8, 0xec),
+    accent: rgb(0x1f, 0x9e, 0x55),
+    sep: rgb(0xd0, 0xd3, 0xd8),
+    pin_bullet: rgb(0x9a, 0x9f, 0xa6),
+    delete: rgb(0xcf, 0x32, 0x32),
+    field_bg: rgb(0xff, 0xff, 0xff),
+    strong: rgb(0x00, 0x00, 0x00),
+};
+const THEME_NORD: Theme = Theme {
+    bg: rgb(0x2e, 0x34, 0x40),
+    text: rgb(0xd8, 0xde, 0xe9),
+    dim: rgb(0x7a, 0x84, 0x99),
+    hover_bg: rgb(0x3b, 0x42, 0x52),
+    accent: rgb(0x88, 0xc0, 0xd0),
+    sep: rgb(0x43, 0x4c, 0x5e),
+    pin_bullet: rgb(0x61, 0x6e, 0x88),
+    delete: rgb(0xbf, 0x61, 0x6a),
+    field_bg: rgb(0x29, 0x2e, 0x39),
+    strong: rgb(0xec, 0xef, 0xf4),
+};
+const THEME_SOLARIZED: Theme = Theme {
+    bg: rgb(0xfd, 0xf6, 0xe3),
+    text: rgb(0x07, 0x36, 0x42),
+    dim: rgb(0x65, 0x7b, 0x83),
+    hover_bg: rgb(0xee, 0xe8, 0xd5),
+    accent: rgb(0x85, 0x99, 0x00),
+    sep: rgb(0xd9, 0xd2, 0xc1),
+    pin_bullet: rgb(0x93, 0xa1, 0xa1),
+    delete: rgb(0xdc, 0x32, 0x2f),
+    field_bg: rgb(0xff, 0xfb, 0xf0),
+    strong: rgb(0x00, 0x2b, 0x36),
+};
+const THEME_CONTRAST: Theme = Theme {
+    bg: rgb(0x00, 0x00, 0x00),
+    text: rgb(0xff, 0xff, 0xff),
+    dim: rgb(0xb0, 0xb0, 0xb0),
+    hover_bg: rgb(0x26, 0x26, 0x26),
+    accent: rgb(0x3b, 0xe6, 0x84),
+    sep: rgb(0x60, 0x60, 0x60),
+    pin_bullet: rgb(0x90, 0x90, 0x90),
+    delete: rgb(0xff, 0x55, 0x55),
+    field_bg: rgb(0x10, 0x10, 0x10),
+    strong: rgb(0xff, 0xff, 0xff),
+};
+
+/// Selectable themes in tray-menu order; index 0 is the default.
+const THEMES: [(&str, Theme); 6] = [
+    ("Dark", THEME_DARK),
+    ("Grey", THEME_GREY),
+    ("Light", THEME_LIGHT),
+    ("Nord", THEME_NORD),
+    ("Solarized", THEME_SOLARIZED),
+    ("High Contrast", THEME_CONTRAST),
+];
+
+struct ThemeCell(std::cell::Cell<Theme>);
+// SAFETY: single-threaded UI thread only, never shared across threads (like the App global).
+unsafe impl Sync for ThemeCell {}
+static THEME: ThemeCell = ThemeCell(std::cell::Cell::new(THEME_DARK));
+
+/// The active palette. Cheap Copy, so call sites read it inline.
+fn theme() -> Theme {
+    THEME.0.get()
+}
+fn set_theme(idx: usize) {
+    THEME.0.set(THEMES.get(idx).map_or(THEME_DARK, |t| t.1));
+}
 const CORNER_RADIUS: i32 = 12; // rounded-corner diameter for the window region
 
 fn lo_hi(lp: LPARAM) -> (i32, i32) {
@@ -1029,17 +1132,22 @@ fn trigger_line(t: Trigger) -> String {
     }
 }
 
-fn save_settings(trigger: Trigger, persist: bool, auto_copy: bool) {
+fn save_settings(trigger: Trigger, persist: bool, auto_copy: bool, theme_idx: usize) {
     let mut s = trigger_line(trigger);
     s.push_str(if persist { "persist=1\n" } else { "persist=0\n" });
     s.push_str(if auto_copy { "autocopy=1\n" } else { "autocopy=0\n" });
+    s.push_str(&format!(
+        "theme={}\n",
+        THEMES.get(theme_idx).map_or("Dark", |t| t.0)
+    ));
     let _ = std::fs::write(appdata_file("settings.txt"), s);
 }
 
-fn load_settings() -> (Trigger, bool, bool) {
+fn load_settings() -> (Trigger, bool, bool, usize) {
     let mut trigger = Trigger::MIDDLE;
     let mut persist = false;
     let mut auto_copy = false;
+    let mut theme_idx = 0;
     if let Ok(text) = std::fs::read_to_string(appdata_file("settings.txt")) {
         for line in text.lines() {
             let line = line.trim();
@@ -1071,10 +1179,14 @@ fn load_settings() -> (Trigger, bool, bool) {
                 persist = v.trim() == "1";
             } else if let Some(v) = line.strip_prefix("autocopy=") {
                 auto_copy = v.trim() == "1";
+            } else if let Some(v) = line.strip_prefix("theme=") {
+                if let Some(i) = THEMES.iter().position(|t| t.0 == v.trim()) {
+                    theme_idx = i;
+                }
             }
         }
     }
-    (trigger, persist, auto_copy)
+    (trigger, persist, auto_copy, theme_idx)
 }
 
 // ---- History persistence (opt-in, DPAPI-encrypted) ------------------------
@@ -1253,10 +1365,10 @@ unsafe extern "system" fn tip_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         let hdc = BeginPaint(hwnd, &mut ps);
         let mut rc: RECT = std::mem::zeroed();
         GetClientRect(hwnd, &mut rc);
-        fill_color(hdc, 0, 0, rc.right, rc.bottom, COL_FIELD_BG);
+        fill_color(hdc, 0, 0, rc.right, rc.bottom, theme().field_bg);
         let oldf = SelectObject(hdc, font as _);
         SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, COL_TEXT);
+        SetTextColor(hdc, theme().text);
         DrawTextW(
             hdc,
             text.as_ptr(),
@@ -1265,7 +1377,7 @@ unsafe extern "system" fn tip_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         );
         SelectObject(hdc, oldf);
-        let border = CreateSolidBrush(COL_ACCENT);
+        let border = CreateSolidBrush(theme().accent);
         FrameRect(hdc, &rc, border);
         DeleteObject(border as _);
         EndPaint(hwnd, &ps);
@@ -1456,6 +1568,7 @@ fn hide_popup(a: &mut App) {
     };
     a.visible = false;
     a.hovered = -1;
+    a.arm_delete = -1;
     unsafe { reconcile_input(a) }; // drop the hook again if a keyboard trigger
 }
 
@@ -1548,7 +1661,7 @@ unsafe fn draw_pin(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, item_
 /// to move it up, the lower half to move it down, so favorites float to the top.
 unsafe fn draw_updown(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
     let mid = (top + bottom) / 2;
-    SetTextColor(hdc, COL_ACCENT);
+    SetTextColor(hdc, theme().accent);
     let up = wide_no_nul("\u{25B2}");
     let mut tr = RECT { left, top, right, bottom: mid };
     DrawTextW(hdc, up.as_ptr(), up.len() as i32, &mut tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -1567,7 +1680,7 @@ unsafe fn draw_scroll_thumb(hdc: HDC, width: i32, y0: i32, y1: i32, total: usize
     let thumb_h = (track * vis as f32 / total as f32).clamp(14.0, track);
     let frac = scroll as f32 / (total - vis) as f32;
     let thumb_y = y0 as f32 + (track - thumb_h) * frac;
-    fill_color(hdc, width - 3, thumb_y as i32, width - 1, (thumb_y + thumb_h) as i32, COL_PIN_BULLET);
+    fill_color(hdc, width - 3, thumb_y as i32, width - 1, (thumb_y + thumb_h) as i32, theme().pin_bullet);
 }
 
 /// Width in pixels of `text` in the font currently selected into `hdc`.
@@ -1579,7 +1692,7 @@ unsafe fn text_width(hdc: HDC, text: &[u16]) -> i32 {
 
 /// A 2px vertical caret bar.
 unsafe fn draw_caret(hdc: HDC, x: i32, top: i32, bottom: i32) {
-    fill_color(hdc, x, top, x + 2, bottom, COL_TEXT);
+    fill_color(hdc, x, top, x + 2, bottom, theme().text);
 }
 
 /// Render the row that's being inline-labeled as a focused text field.
@@ -1591,8 +1704,8 @@ unsafe fn paint_edit_row(hdc: HDC, a: &App, r: &VRow, text_left: i32) {
     let inset = (a.pad / 2).max(1);
     let (fx0, fx1) = (text_left - a.pad, a.width - a.pad);
     let (fy0, fy1) = (r.top + inset, r.bottom - inset);
-    fill_color(hdc, fx0, fy0, fx1, fy1, COL_FIELD_BG);
-    let frame = CreateSolidBrush(COL_ACCENT);
+    fill_color(hdc, fx0, fy0, fx1, fy1, theme().field_bg);
+    let frame = CreateSolidBrush(theme().accent);
     let fr = RECT { left: fx0, top: fy0, right: fx1, bottom: fy1 };
     FrameRect(hdc, &fr, frame);
     DeleteObject(frame as _);
@@ -1603,11 +1716,11 @@ unsafe fn paint_edit_row(hdc: HDC, a: &App, r: &VRow, text_left: i32) {
         if a.caret_on {
             draw_caret(hdc, text_left, ctop, cbot);
         }
-        SetTextColor(hdc, COL_DIM);
+        SetTextColor(hdc, theme().dim);
         let hint = wide_no_nul("Type a label  \u{2014}  Enter to pin, Esc to cancel");
         draw_text_row(hdc, text_left + a.pad, r.top, tr, r.bottom, &hint);
     } else {
-        SetTextColor(hdc, COL_WHITE);
+        SetTextColor(hdc, theme().strong);
         draw_text_row(hdc, text_left, r.top, tr, r.bottom, &ed.label);
         if a.caret_on {
             let cx = (text_left + text_width(hdc, &ed.label) + 1).min(tr - 2);
@@ -1790,16 +1903,16 @@ unsafe fn paint_about(hdc: HDC, a: &App, rc: &RECT) {
     SetBrushOrgEx(hdc, 0, 0, null_mut());
     DrawIconEx(hdc, lay.icon.left, lay.icon.top, icon, sz, sz, 0, null_mut(), DI_NORMAL);
     DestroyIcon(icon);
-    SetTextColor(hdc, COL_TEXT);
+    SetTextColor(hdc, theme().text);
     draw_center(hdc, a, lay.title_y, &wide_no_nul(&format!("ClipStack  v{}", env!("CARGO_PKG_VERSION"))));
-    SetTextColor(hdc, COL_DIM);
+    SetTextColor(hdc, theme().dim);
     draw_center(hdc, a, lay.tagline_y, &wide_no_nul(ABOUT_TAGLINE));
-    SetTextColor(hdc, COL_ACCENT);
+    SetTextColor(hdc, theme().accent);
     draw_center(hdc, a, lay.web.0, &wide_no_nul("hologramhacks.com"));
     draw_center(hdc, a, lay.gh.0, &wide_no_nul("github.com/HologramHacks/clipstack"));
-    SetTextColor(hdc, COL_DIM);
+    SetTextColor(hdc, theme().dim);
     draw_center(hdc, a, lay.footer_y, &wide_no_nul("Built by Brian Jones"));
-    let border = CreateSolidBrush(COL_ACCENT);
+    let border = CreateSolidBrush(theme().accent);
     FrameRect(hdc, rc, border);
     DeleteObject(border as _);
 }
@@ -1811,12 +1924,12 @@ unsafe fn paint(hwnd: HWND) {
     let mut rc: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut rc);
 
-    fill_color(hdc, 0, 0, rc.right, rc.bottom, COL_BG);
+    fill_color(hdc, 0, 0, rc.right, rc.bottom, theme().bg);
     let oldf = SelectObject(hdc, a.font as _);
     SetBkMode(hdc, TRANSPARENT as i32);
 
     if a.capturing {
-        SetTextColor(hdc, COL_TEXT);
+        SetTextColor(hdc, theme().text);
         let prompt = wide_no_nul("Press a key combo or a mouse button  \u{2014}  Esc to cancel");
         let mut tr = RECT { left: a.pad * 2, top: 0, right: rc.right - a.pad * 2, bottom: rc.bottom };
         DrawTextW(
@@ -1827,7 +1940,7 @@ unsafe fn paint(hwnd: HWND) {
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
         SelectObject(hdc, oldf);
-        let border = CreateSolidBrush(COL_ACCENT);
+        let border = CreateSolidBrush(theme().accent);
         FrameRect(hdc, &rc, border);
         DeleteObject(border as _);
         EndPaint(hwnd, &ps);
@@ -1850,7 +1963,7 @@ unsafe fn paint(hwnd: HWND) {
         match r.kind {
             RowKind::Sep => {
                 let mid = (r.top + r.bottom) / 2;
-                fill_color(hdc, text_left, mid, a.width - text_left, mid + 1, COL_SEP);
+                fill_color(hdc, text_left, mid, a.width - text_left, mid + 1, theme().sep);
             }
             RowKind::Hist(i) => {
                 if a.edit.as_ref().is_some_and(|e| e.hist == i) {
@@ -1858,46 +1971,52 @@ unsafe fn paint(hwnd: HWND) {
                     continue;
                 }
                 if hovered {
-                    fill_color(hdc, 0, r.top, a.width, r.bottom, COL_HOVER_BG);
-                    fill_color(hdc, 0, r.top, bar_w, r.bottom, COL_ACCENT);
+                    fill_color(hdc, 0, r.top, a.width, r.bottom, theme().hover_bg);
+                    fill_color(hdc, 0, r.top, bar_w, r.bottom, theme().accent);
                 }
                 match &a.history[i] {
                     Clip::Text(s) => {
-                        SetTextColor(hdc, if hovered { COL_WHITE } else { COL_TEXT });
+                        SetTextColor(hdc, if hovered { theme().strong } else { theme().text });
                         draw_text_row(hdc, text_left, r.top, pin_col, r.bottom, &make_preview(s));
                     }
                     Clip::Image(ic) => {
                         let dw = draw_thumb(hdc, ic, text_left, r.top + a.pad, a.item_h - a.pad * 2);
                         let tx = text_left + dw + a.pad * 2;
-                        SetTextColor(hdc, if hovered { rgb(220, 220, 225) } else { COL_DIM });
+                        SetTextColor(hdc, if hovered { rgb(220, 220, 225) } else { theme().dim });
                         let label = format!("image  {} \u{00d7} {}", ic.w, ic.h);
                         draw_text_row(hdc, tx, r.top, text_right, r.bottom, &wide_no_nul(&label));
                     }
                 }
                 if hovered {
                     if matches!(&a.history[i], Clip::Text(_)) {
-                        SetTextColor(hdc, COL_ACCENT);
+                        SetTextColor(hdc, theme().accent);
                         draw_pin(hdc, pin_col, r.top, text_right, r.bottom, a.item_h);
                     }
-                    SetTextColor(hdc, COL_DELETE);
+                    SetTextColor(hdc, theme().delete);
                     draw_x(hdc, text_right, r.top, a.width, r.bottom);
                 }
             }
             RowKind::Pin(j) => {
                 if hovered {
-                    fill_color(hdc, 0, r.top, a.width, r.bottom, COL_HOVER_BG);
-                    fill_color(hdc, 0, r.top, bar_w, r.bottom, COL_ACCENT);
+                    fill_color(hdc, 0, r.top, a.width, r.bottom, theme().hover_bg);
+                    fill_color(hdc, 0, r.top, bar_w, r.bottom, theme().accent);
                 }
                 // Dim masked bullets, then the label in bright text after them.
                 let bullets = wide_no_nul(&"\u{2022}".repeat(8));
-                SetTextColor(hdc, COL_PIN_BULLET);
+                SetTextColor(hdc, theme().pin_bullet);
                 draw_text_row(hdc, text_left, r.top, pin_col, r.bottom, &bullets);
                 let lx = text_left + text_width(hdc, &bullets) + a.pad * 3;
-                SetTextColor(hdc, if hovered { COL_WHITE } else { COL_TEXT });
+                SetTextColor(hdc, if hovered { theme().strong } else { theme().text });
                 draw_text_row(hdc, lx, r.top, pin_col, r.bottom, &wide_no_nul(&a.pins[j].label));
-                if hovered {
+                if hovered && idx as i32 == a.arm_delete {
+                    // Armed: a solid red confirm button (inverted ✕), so a stray
+                    // first click clearly warns instead of deleting.
+                    fill_color(hdc, text_right, r.top + 1, a.width, r.bottom, theme().delete);
+                    SetTextColor(hdc, theme().bg);
+                    draw_x(hdc, text_right, r.top, a.width, r.bottom);
+                } else if hovered {
                     draw_updown(hdc, pin_col, r.top, text_right, r.bottom);
-                    SetTextColor(hdc, COL_DELETE);
+                    SetTextColor(hdc, theme().delete);
                     draw_x(hdc, text_right, r.top, a.width, r.bottom);
                 }
             }
@@ -1921,9 +2040,9 @@ unsafe fn paint(hwnd: HWND) {
 
     if let Some(msg) = &a.toast {
         let top = rc.bottom - a.item_h;
-        fill_color(hdc, 0, top, rc.right, rc.bottom, COL_FIELD_BG);
-        fill_color(hdc, 0, top, rc.right, top + 1, COL_ACCENT); // thin green divider
-        SetTextColor(hdc, COL_ACCENT);
+        fill_color(hdc, 0, top, rc.right, rc.bottom, theme().field_bg);
+        fill_color(hdc, 0, top, rc.right, top + 1, theme().accent); // thin green divider
+        SetTextColor(hdc, theme().accent);
         let w = wide_no_nul(msg);
         let mut tr = RECT { left: a.pad * 2, top, right: rc.right - a.pad * 2, bottom: rc.bottom };
         DrawTextW(
@@ -1936,7 +2055,7 @@ unsafe fn paint(hwnd: HWND) {
     }
 
     SelectObject(hdc, oldf);
-    let border = CreateSolidBrush(COL_SEP);
+    let border = CreateSolidBrush(theme().sep);
     FrameRect(hdc, &rc, border);
     DeleteObject(border as _);
     EndPaint(hwnd, &ps);
@@ -2123,8 +2242,9 @@ unsafe fn set_trigger(t: Trigger) {
     };
     update_tray_tip(hwnd, &desc);
     if ok {
-        let (persist, auto_copy) = { let a = app(); (a.persist, a.auto_copy) };
-        save_settings(t, persist, auto_copy);
+        let (persist, auto_copy, theme_idx) =
+            { let a = app(); (a.persist, a.auto_copy, a.theme_idx) };
+        save_settings(t, persist, auto_copy, theme_idx);
     } else {
         warn_hotkey_taken(hwnd);
     }
@@ -2232,8 +2352,9 @@ unsafe fn finish_capture(new: Option<Trigger>) {
     };
     if let Some(t) = new {
         if !failed {
-            let (persist, auto_copy) = { let a = app(); (a.persist, a.auto_copy) };
-            save_settings(t, persist, auto_copy);
+            let (persist, auto_copy, theme_idx) =
+                { let a = app(); (a.persist, a.auto_copy, a.theme_idx) };
+            save_settings(t, persist, auto_copy, theme_idx);
         }
     }
     if !restore.is_null() {
@@ -2463,6 +2584,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let row = row_at(&a, y).map(|i| i as i32).unwrap_or(-1);
             if row != a.hovered {
                 a.hovered = row;
+                if a.arm_delete >= 0 && a.arm_delete != row {
+                    a.arm_delete = -1; // moved off the armed pin: disarm it
+                }
                 InvalidateRect(hwnd, null(), 1);
             }
             // Tooltip: hint the reorder gesture when hovering a pin's arrows.
@@ -2482,6 +2606,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSELEAVE => {
             let mut a = app();
             a.hovered = -1;
+            a.arm_delete = -1; // disarm any pending pin-delete on leave
             a.tracking_leave = false;
             hide_tip(&mut a);
             InvalidateRect(hwnd, null(), 1);
@@ -2523,16 +2648,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             let act = {
                 let mut a = app();
+                let was_armed = a.arm_delete;
+                a.arm_delete = -1; // any click disarms a pending pin-delete by default
                 match row_at(&a, y) {
                     Some(idx) if x >= a.width - a.item_h => {
-                        // Clicked the ✕ delete affordance on the right edge.
-                        delete_row(&mut a, idx);
-                        if a.history.is_empty() && a.pins.is_empty() {
-                            hide_popup(&mut a);
+                        // Clicked the ✕ on the right edge. Pins require a confirming
+                        // second click: the first click arms it (history deletes in one).
+                        if matches!(a.rows[idx].kind, RowKind::Pin(_)) && was_armed != idx as i32 {
+                            a.arm_delete = idx as i32;
+                            InvalidateRect(a.hwnd, null(), 1);
+                            Act::None
                         } else {
-                            relayout(&mut a);
+                            delete_row(&mut a, idx);
+                            if a.history.is_empty() && a.pins.is_empty() {
+                                hide_popup(&mut a);
+                            } else {
+                                relayout(&mut a);
+                            }
+                            Act::None
                         }
-                        Act::None
                     }
                     Some(idx) if x >= a.width - a.item_h * 2 => {
                         // The affordance column: text history rows pin here; pin
@@ -2716,7 +2850,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_PERSIST => {
                     let mut a = app();
                     a.persist = !a.persist;
-                    save_settings(a.trigger, a.persist, a.auto_copy);
+                    save_settings(a.trigger, a.persist, a.auto_copy, a.theme_idx);
                     if a.persist {
                         save_history(&a); // capture what's already in memory
                     } else {
@@ -2726,13 +2860,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_AUTOCOPY => {
                     let mut a = app();
                     a.auto_copy = !a.auto_copy;
-                    save_settings(a.trigger, a.persist, a.auto_copy);
+                    save_settings(a.trigger, a.persist, a.auto_copy, a.theme_idx);
                     reconcile_input(&mut a); // install/remove the hook for drag-watching
                 }
                 ID_TRIG_CUSTOM => start_capture(),
                 cmd => {
                     if let Some(&(_, t, _)) = PRESETS.iter().find(|&&(id, _, _)| id == cmd) {
                         set_trigger(t);
+                    } else if (ID_THEME_BASE..ID_THEME_BASE + THEMES.len()).contains(&cmd) {
+                        let mut a = app();
+                        a.theme_idx = cmd - ID_THEME_BASE;
+                        set_theme(a.theme_idx);
+                        save_settings(a.trigger, a.persist, a.auto_copy, a.theme_idx);
+                        InvalidateRect(a.hwnd, null(), 1); // repaint in the new theme
                     }
                 }
             }
@@ -2748,9 +2888,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 unsafe fn show_tray_menu(hwnd: HWND) {
-    let (paused, trigger, persist, auto_copy) = {
+    let (paused, trigger, persist, auto_copy, theme_idx) = {
         let a = app();
-        (a.paused, a.trigger, a.persist, a.auto_copy)
+        (a.paused, a.trigger, a.persist, a.auto_copy, a.theme_idx)
     };
     let mut pt: POINT = std::mem::zeroed();
     GetCursorPos(&mut pt);
@@ -2791,6 +2931,19 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         autocopy_flags |= MF_CHECKED;
     }
     AppendMenuW(menu, autocopy_flags, ID_AUTOCOPY, wide("Auto-copy on highlight").as_ptr());
+    // Theme submenu, radio-checked on the active theme.
+    let theme_sub = CreatePopupMenu();
+    for (i, (name, _)) in THEMES.iter().enumerate() {
+        AppendMenuW(theme_sub, MF_STRING, ID_THEME_BASE + i, wide(name).as_ptr());
+    }
+    CheckMenuRadioItem(
+        theme_sub,
+        ID_THEME_BASE as u32,
+        (ID_THEME_BASE + THEMES.len() - 1) as u32,
+        (ID_THEME_BASE + theme_idx) as u32,
+        MF_BYCOMMAND,
+    );
+    AppendMenuW(menu, MF_POPUP, theme_sub as usize, wide("Theme").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
 
     let pause_label = if paused { wide("Resume capture") } else { wide("Pause capture") };
@@ -2942,7 +3095,8 @@ fn main() {
         }
 
         let pins = load_pins();
-        let (trigger, persist, auto_copy) = load_settings();
+        let (trigger, persist, auto_copy, theme_idx) = load_settings();
+        set_theme(theme_idx);
         let history = if persist { load_history() } else { Vec::new() };
 
         *G.0.borrow_mut() = Some(App {
@@ -2960,6 +3114,8 @@ fn main() {
             pin_scroll: 0,
             auto_copy,
             drag_start: None,
+            theme_idx,
+            arm_delete: -1,
             target: null_mut(),
             paused: false,
             visible: false,
