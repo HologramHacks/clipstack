@@ -2552,6 +2552,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if a.edit.is_some() {
                 return 0; // freeze the list while labeling so indices can't shift
             }
+            let (old_scroll, old_pin) = (a.scroll, a.pin_scroll);
             // Scroll whichever section the cursor is over: pins (below the
             // separator) or history (above it).
             let cy = lp as i32 - a.popup_y;
@@ -2573,6 +2574,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     a.scroll = (a.scroll + SCROLL_STEP).min(max);
                 }
                 _ => {}
+            }
+            if a.scroll == old_scroll && a.pin_scroll == old_pin {
+                return 0; // already at the end in that direction: nothing moved, so no
+                          // rebuild and no repaint, which is what caused the end flicker
             }
             a.hovered = -1;
             rebuild_rows(&mut a);
