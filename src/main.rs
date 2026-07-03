@@ -75,7 +75,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const MAX_HISTORY: usize = 50;
 const MAX_PINS: usize = 99; // generous cap; the pin block scrolls past PIN_VISIBLE
-const VISIBLE: usize = 15; // history rows shown before it scrolls
+const VISIBLE: usize = 20; // history rows shown before it scrolls
 const PIN_VISIBLE: usize = 8; // pin rows shown before the pin block scrolls
 const SCROLL_STEP: usize = 3;
 
@@ -243,6 +243,7 @@ struct App {
     history: Vec<Clip>,
     pins: Vec<Pin>,
     last_seq: u32,
+    poll_misses: u8, // consecutive polls where a changed clipboard read back empty
     rows: Vec<VRow>,
     scroll: usize,
     pin_scroll: usize,
@@ -675,15 +676,28 @@ fn poll_clip(a: &mut App) {
     if seq == a.last_seq {
         return;
     }
-    a.last_seq = seq;
-    if let Some((w, h, rgba)) = unsafe { clip_get_image(a.hwnd) } {
-        add_image(a, w, h, rgba);
+    // Read both formats under a single clipboard open. If the app that just
+    // copied still holds the clipboard, the open fails: leave last_seq alone and
+    // retry next tick so the clip isn't lost (the "copy twice" bug).
+    if unsafe { OpenClipboard(a.hwnd) } == 0 {
         return;
     }
-    if let Some(t) = unsafe { clip_get_text(a.hwnd) } {
-        if !t.is_empty() {
-            add_text(a, t);
-        }
+    let img = unsafe { clip_get_image() };
+    let txt = if img.is_none() { unsafe { clip_get_text() } } else { None };
+    unsafe { CloseClipboard() };
+    // Read came back empty even though the sequence changed (a slow app rendering
+    // its data on demand): retry a few ticks before giving up, so it still lands
+    // on the first copy instead of forcing a second one.
+    if img.is_none() && txt.is_none() && a.poll_misses < 4 {
+        a.poll_misses += 1;
+        return;
+    }
+    a.poll_misses = 0;
+    a.last_seq = seq;
+    match (img, txt) {
+        (Some((w, h, rgba)), _) => add_image(a, w, h, rgba),
+        (None, Some(t)) if !t.is_empty() => add_text(a, t),
+        _ => {}
     }
 }
 
@@ -699,10 +713,8 @@ fn set_clipboard(a: &mut App, clip: &Clip) {
 }
 
 /// Read clipboard text (CF_UNICODETEXT), or None if there's no text.
-unsafe fn clip_get_text(hwnd: HWND) -> Option<String> {
-    if OpenClipboard(hwnd) == 0 {
-        return None;
-    }
+unsafe fn clip_get_text() -> Option<String> {
+    // Caller already holds the clipboard open.
     let mut out = None;
     let h = GetClipboardData(CF_UNICODETEXT);
     if !h.is_null() {
@@ -717,15 +729,12 @@ unsafe fn clip_get_text(hwnd: HWND) -> Option<String> {
             GlobalUnlock(h);
         }
     }
-    CloseClipboard();
     out
 }
 
 /// Read a clipboard image (CF_DIB) as top-left-origin RGBA, or None.
-unsafe fn clip_get_image(hwnd: HWND) -> Option<(usize, usize, Vec<u8>)> {
-    if OpenClipboard(hwnd) == 0 {
-        return None;
-    }
+/// Caller already holds the clipboard open.
+unsafe fn clip_get_image() -> Option<(usize, usize, Vec<u8>)> {
     let mut out = None;
     let h = GetClipboardData(CF_DIB);
     if !h.is_null() {
@@ -735,7 +744,6 @@ unsafe fn clip_get_image(hwnd: HWND) -> Option<(usize, usize, Vec<u8>)> {
             GlobalUnlock(h);
         }
     }
-    CloseClipboard();
     out
 }
 
@@ -1427,10 +1435,10 @@ fn show_popup(a: &mut App, cx: i32, cy: i32) {
     }
     let dpi = unsafe { dpi_for_point(cx, cy) };
     let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
-    a.item_h = (34.0 * scale) as i32;
+    a.item_h = (28.0 * scale) as i32;
     a.sep_h = (12.0 * scale) as i32;
     a.pad = (6.0 * scale) as i32;
-    a.width = (460.0 * scale) as i32;
+    a.width = (306.0 * scale) as i32;
 
     if !a.font.is_null() {
         unsafe { DeleteObject(a.font as _) };
@@ -1511,9 +1519,9 @@ unsafe fn make_font(scale: f32) -> HFONT {
 fn show_capture_prompt(a: &mut App, cx: i32, cy: i32) {
     let dpi = unsafe { dpi_for_point(cx, cy) };
     let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
-    a.item_h = (34.0 * scale) as i32;
+    a.item_h = (28.0 * scale) as i32;
     a.pad = (6.0 * scale) as i32;
-    a.width = (460.0 * scale) as i32;
+    a.width = (306.0 * scale) as i32;
     if !a.font.is_null() {
         unsafe { DeleteObject(a.font as _) };
     }
@@ -2630,11 +2638,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             let row = row_at(&a, y).map(|i| i as i32).unwrap_or(-1);
             if row != a.hovered {
+                let old = a.hovered;
                 a.hovered = row;
                 if a.arm_delete >= 0 && a.arm_delete != row {
                     a.arm_delete = -1; // moved off the armed pin: disarm it
                 }
-                InvalidateRect(hwnd, null(), 1);
+                // Repaint only the two affected rows so the rest of the list
+                // doesn't flash on hover.
+                for r in [old, row] {
+                    if let Some(vr) = usize::try_from(r).ok().and_then(|i| a.rows.get(i)) {
+                        let rc = RECT { left: 0, top: vr.top, right: a.width, bottom: vr.bottom };
+                        InvalidateRect(hwnd, &rc, 1);
+                    }
+                }
             }
             // Tooltip: hint the reorder gesture when hovering a pin's arrows.
             let over_arrows = !a.about
@@ -3150,6 +3166,7 @@ fn main() {
             history,
             pins,
             last_seq: 0,
+            poll_misses: 0,
             rows: Vec::new(),
             scroll: 0,
             pin_scroll: 0,
