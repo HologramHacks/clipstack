@@ -3,6 +3,9 @@ name = "clipstack"
 version = "0.4.3"
 edition = "2021"
 description = "Tiny clipboard history popup for Windows (configurable trigger)"
+license = "MIT"
+repository = "https://github.com/HologramHacks/clipstack"
+authors = ["Brian Jones"]
 
 [dependencies]
 

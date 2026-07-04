@@ -1,4 +1,4 @@
-// ClipStack — a tiny clipboard-history popup for Windows.
+// ClipStack, a tiny clipboard-history popup for Windows.
 //
 // * Keeps the last MAX_HISTORY text/image clips; the popup shows VISIBLE at a
 //   time and the mouse wheel scrolls the rest.
@@ -13,7 +13,7 @@
 // callback and the window procedure both execute on this one thread, so the
 // global `App` is only ever touched there. We take a `&mut App` for one handler
 // and never hold it across a Win32 call that pumps messages (TrackPopupMenu,
-// SetForegroundWindow) — borrows are scoped accordingly.
+// SetForegroundWindow), borrows are scoped accordingly.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 #![allow(non_snake_case)]
 
@@ -212,7 +212,7 @@ impl Trigger {
 }
 
 /// The trigger presets, defined once and used by the tray submenu, the radio
-/// check, and the command handler — so they can't drift out of sync.
+/// check, and the command handler, so they can't drift out of sync.
 const PRESETS: [(usize, Trigger, &str); 4] = [
     (ID_TRIG_MIDDLE, Trigger::MIDDLE, "Middle click"),
     (ID_TRIG_MOUSE4, Trigger::MOUSE4, "Mouse 4 (back)"),
@@ -277,7 +277,7 @@ struct App {
 }
 
 struct Global(RefCell<Option<App>>);
-// SAFETY: ClipStack is single-threaded — the message loop, the mouse hook, and
+// SAFETY: ClipStack is single-threaded, the message loop, the mouse hook, and
 // the window procedure all run on the one UI thread, so `G` is never actually
 // shared across threads. The RefCell enforces the single-borrow rule at runtime,
 // turning any reentrant aliasing slip into a clean panic instead of UB.
@@ -750,7 +750,7 @@ unsafe fn clip_get_image() -> Option<(usize, usize, Vec<u8>)> {
 /// Parse a packed DIB (header + optional masks/palette + pixels) into RGBA.
 /// Defensive against malformed clipboard data: every offset is bounds-checked
 /// and the dimensions are capped, so a bad DIB yields None, never UB. Handles
-/// 24- and 32-bit BI_RGB / BI_BITFIELDS — what real apps put on the clipboard.
+/// 24- and 32-bit BI_RGB / BI_BITFIELDS, what real apps put on the clipboard.
 fn dib_to_rgba(d: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     if d.len() < 40 {
         return None;
@@ -816,8 +816,8 @@ fn dib_to_rgba(d: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     Some((w, h, out))
 }
 
-/// Put text on the clipboard (CF_UNICODETEXT). When `exclude` is set — pasting a
-/// pinned secret — also tag it out of Windows clipboard history (Win+V) and
+/// Put text on the clipboard (CF_UNICODETEXT). When `exclude` is set, pasting a
+/// pinned secret, also tag it out of Windows clipboard history (Win+V) and
 /// cloud sync, the way password managers do (these formats have no library, so
 /// it's done by hand here either way).
 unsafe fn set_clipboard_text(hwnd: HWND, s: &str, exclude: bool) {
@@ -888,7 +888,7 @@ unsafe fn global_from(bytes: &[u8]) -> *mut c_void {
 }
 
 /// `SetClipboardData`, freeing the handle if the system didn't take ownership
-/// (a failed call leaves us owning it — free it so we don't leak).
+/// (a failed call leaves us owning it, free it so we don't leak).
 unsafe fn set_clip_data(fmt: u32, h: *mut c_void) {
     if h.is_null() {
         return;
@@ -1080,7 +1080,7 @@ fn migrate_data() {
 }
 
 /// DPAPI-encrypt `s` and write it to `path`. Writes nothing if encryption
-/// fails — there is never a plaintext fallback.
+/// fails, there is never a plaintext fallback.
 fn write_encrypted(path: std::path::PathBuf, s: &str) {
     if let Some(enc) = dpapi_protect(s.as_bytes()) {
         let _ = std::fs::write(path, enc);
@@ -1124,7 +1124,7 @@ fn load_pins() -> Vec<Pin> {
     pins
 }
 
-// settings.txt is plaintext — the trigger/persist flags aren't secrets
+// settings.txt is plaintext, the trigger/persist flags aren't secrets
 // (unlike the DPAPI-encrypted pins and history).
 
 fn trigger_line(t: Trigger) -> String {
@@ -1201,7 +1201,7 @@ fn load_settings() -> (Trigger, bool, bool, usize) {
 // ---- History persistence (opt-in, DPAPI-encrypted) ------------------------
 
 /// Persist the text clips (most-recent-first) DPAPI-encrypted to history.dat.
-/// Only written when the user opts in; images are skipped — they stay
+/// Only written when the user opts in; images are skipped, they stay
 /// memory-only even when "Remember history" is on.
 fn save_history(a: &App) {
     let mut s = String::new();
@@ -1237,7 +1237,7 @@ fn clear_history_file() {
 // ---- Launch at startup (opt-in HKCU Run key) ------------------------------
 
 /// Full path to our own exe as a NUL-terminated wide string, or None if it
-/// can't be determined or is too long for the buffer — so we never write a
+/// can't be determined or is too long for the buffer, so we never write a
 /// truncated/garbage Run-key value.
 fn exe_path_w() -> Option<Vec<u16>> {
     let mut buf = [0u16; 600];
@@ -1295,7 +1295,7 @@ fn startup_enabled() -> bool {
     }
 }
 
-/// Add or remove the Run-key entry. Only ever called from the tray toggle —
+/// Add or remove the Run-key entry. Only ever called from the tray toggle,
 /// never set automatically, so we don't surprise users or trip AV heuristics.
 fn set_startup(on: bool) {
     let subkey = wide(RUN_SUBKEY);
@@ -1464,7 +1464,7 @@ unsafe fn round_window(hwnd: HWND, w: i32, h: i32) {
 
 /// Effective DPI of the monitor under a screen point. We read the *target*
 /// monitor (where the popup is about to open) rather than GetDpiForWindow,
-/// which would report the monitor the window currently sits on — so the very
+/// which would report the monitor the window currently sits on, so the very
 /// first open on a differently-scaled screen uses the correct scale.
 unsafe fn dpi_for_point(cx: i32, cy: i32) -> u32 {
     let hmon = MonitorFromPoint(POINT { x: cx, y: cy }, MONITOR_DEFAULTTONEAREST);
@@ -1650,7 +1650,7 @@ unsafe fn draw_x(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
 }
 
 /// Green pushpin (Segoe MDL2) shown on a hovered text row so it's obvious you
-/// can pin it — mirrors draw_x, but in the icon font and sized to the row.
+/// can pin it, mirrors draw_x, but in the icon font and sized to the row.
 unsafe fn draw_pin(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, item_h: i32) {
     let face = wide("Segoe MDL2 Assets");
     let f = CreateFontW(
@@ -1790,7 +1790,7 @@ unsafe fn start_pin(i: usize) {
     let (start, capped) = {
         let mut a = app();
         if !matches!(a.history.get(i), Some(Clip::Text(_))) {
-            (None, false) // image (or gone) — can't pin
+            (None, false) // image (or gone), can't pin
         } else if a.pins.len() >= MAX_PINS {
             (None, true) // at the limit
         } else {
@@ -1884,7 +1884,7 @@ struct AboutLayout {
     height: i32,
 }
 
-/// Vertical layout of the About panel — shared by the painter and the click
+/// Vertical layout of the About panel, shared by the painter and the click
 /// hit-test so the link bands line up exactly with what's drawn.
 fn about_layout(a: &App) -> AboutLayout {
     let (pad, lh) = (a.pad, a.item_h);
@@ -1910,7 +1910,7 @@ fn about_layout(a: &App) -> AboutLayout {
     AboutLayout { icon, title_y, tagline_y, web, gh, footer_y, height: y }
 }
 
-/// Open the About panel near the cursor — an on-brand dark card, not a MessageBox.
+/// Open the About panel near the cursor, an on-brand dark card, not a MessageBox.
 fn show_about(a: &mut App, cx: i32, cy: i32) {
     let dpi = unsafe { dpi_for_point(cx, cy) };
     let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
@@ -1945,7 +1945,7 @@ unsafe fn paint_about(hdc: HDC, a: &App, rc: &RECT) {
     let sz = lay.icon.right - lay.icon.left;
     // Load a crisp high-res frame (128px) and let the DC's halftone stretch
     // smooth the downscale. Requesting the icon at the small panel size made GDI
-    // scale a tiny frame badly — that was the blur.
+    // scale a tiny frame badly, that was the blur.
     let icon = load_app_icon(128, 128);
     SetStretchBltMode(hdc, STRETCH_HALFTONE);
     SetBrushOrgEx(hdc, 0, 0, null_mut());
@@ -2310,9 +2310,9 @@ unsafe fn set_trigger(t: Trigger) {
     }
 }
 
-/// Fill a tray icon's tooltip with "ClipStack — {desc} to open".
+/// Fill a tray icon's tooltip with "ClipStack: {desc} to open".
 unsafe fn set_tip(nid: &mut NOTIFYICONDATAW, desc: &str) {
-    let tip = wide(&format!("ClipStack \u{2014} {} to open", desc));
+    let tip = wide(&format!("ClipStack: {} to open", desc));
     let n = tip.len().min(nid.szTip.len());
     nid.szTip[..n].copy_from_slice(&tip[..n]);
 }
@@ -2401,7 +2401,7 @@ unsafe fn finish_capture(new: Option<Trigger>) {
             a.trigger = t;
             reconcile_input(&mut a);
             if t.is_key() && !a.hotkey_active {
-                a.trigger = prev; // couldn't register the combo — keep the old one
+                a.trigger = prev; // couldn't register the combo, keep the old one
                 reconcile_input(&mut a);
                 failed = true;
             }
@@ -2610,7 +2610,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     a.caret_on = !a.caret_on;
                     InvalidateRect(hwnd, null(), 0);
                 } else if !a.visible {
-                    // Don't ingest new clips while the popup is open — it would
+                    // Don't ingest new clips while the popup is open, it would
                     // shift the history indices the on-screen rows point at.
                     poll_clip(&mut a);
                 }
@@ -2810,8 +2810,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     0x1B => end_edit(false), // VK_ESCAPE: cancel
                     0x0D => {
                         // VK_RETURN: pin only when the trimmed label is non-empty.
-                        // On empty-Enter we intentionally do nothing — keeping the
-                        // field open to keep typing — rather than calling end_edit
+                        // On empty-Enter we intentionally do nothing, keeping the
+                        // field open to keep typing, rather than calling end_edit
                         // (which would close it). Don't "simplify" into end_edit(true).
                         let ready = app().edit.as_ref().is_some_and(|e| {
                             !String::from_utf16_lossy(&e.label).trim().is_empty()
@@ -3376,7 +3376,7 @@ mod tests {
         bad_bpp[8] = 1;
         bad_bpp[14] = 7; // unsupported bit depth
         assert!(dib_to_rgba(&bad_bpp).is_none());
-        // Header claims 1000x1000 but carries no pixel data — bounds check rejects.
+        // Header claims 1000x1000 but carries no pixel data, bounds check rejects.
         let mut huge = vec![0u8; 40];
         huge[0] = 40;
         huge[4..8].copy_from_slice(&1000i32.to_le_bytes());

@@ -3,7 +3,7 @@
 # workflow). This offsets the "unknown publisher" SmartScreen warning for
 # anyone who cares to verify, without a paid code-signing cert.
 #
-# Additive: a release created by hand still works if this fails — it just adds
+# Additive: a release created by hand still works if this fails, it just adds
 # the checksum + provenance and replaces the exe with the reproducible CI build.
 name: Release
 

@@ -1,6 +1,6 @@
 version: 2
 updates:
-  # Rust dependencies — weekly security/version PRs.
+  # Rust dependencies, weekly security/version PRs.
   - package-ecosystem: cargo
     directory: "/"
     schedule:
