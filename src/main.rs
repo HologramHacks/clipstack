@@ -1018,7 +1018,11 @@ fn appdata_file(name: &str) -> std::path::PathBuf {
 
 /// One-time lift of data out of the per-machine subfolder
 /// (ClipStack\<COMPUTERNAME>\) that versions through 0.4.3 used, so
-/// upgrades keep their pins and history. Copies, never overwrites.
+/// upgrades keep their pins and history. The newer file wins: older
+/// versions left stale copies in the flat folder, and letting those
+/// shadow the live subfolder data silently reverts the user (the 0.4.4
+/// upgrade bug). Copy, verify, then delete the legacy folder so it can
+/// never shadow anything again.
 fn migrate_data() {
     let Some(local) = std::env::var_os("LOCALAPPDATA") else {
         return;
@@ -1030,11 +1034,37 @@ fn migrate_data() {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
     let src = base.join(if sub.is_empty() { "default".to_string() } else { sub });
-    for name in ["pins.dat", "history.dat", "settings.txt"] {
+    migrate_from(&src, &base);
+}
+
+/// The testable core of `migrate_data`: lift the three data files from the
+/// legacy `src` folder into `base`, newest file winning, then remove `src`
+/// once everything is verified present at the destination.
+fn migrate_from(src: &std::path::Path, base: &std::path::Path) {
+    if !src.is_dir() {
+        return;
+    }
+    // Strictly newer; fs::copy preserves the write time on Windows, so a
+    // completed copy makes this false for that pair.
+    let newer = |a: &std::path::Path, b: &std::path::Path| {
+        let m = |p: &std::path::Path| std::fs::metadata(p).and_then(|md| md.modified()).ok();
+        matches!((m(a), m(b)), (Some(x), Some(y)) if x > y)
+    };
+    let names = ["pins.dat", "history.dat", "settings.txt"];
+    for name in names {
         let (s, d) = (src.join(name), base.join(name));
-        if s.exists() && !d.exists() {
+        if s.exists() && (!d.exists() || newer(&s, &d)) {
             let _ = std::fs::copy(&s, d);
         }
+    }
+    // Delete the legacy folder only once every file it holds is confirmed
+    // present at the destination and at least as new.
+    let verified = names.iter().all(|name| {
+        let (s, d) = (src.join(name), base.join(name));
+        !s.exists() || (d.exists() && !newer(&s, &d))
+    });
+    if verified {
+        let _ = std::fs::remove_dir_all(src);
     }
 }
 
@@ -3086,6 +3116,27 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrate_prefers_newer_and_removes_legacy_folder() {
+        let root = std::env::temp_dir().join(format!("clipstack-mig-{}", std::process::id()));
+        let base = root.join("ClipStack");
+        let src = base.join("MACHINE");
+        std::fs::create_dir_all(&src).unwrap();
+        // Stale flat copy first, newer legacy data second: legacy must win.
+        std::fs::write(base.join("pins.dat"), b"stale").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(src.join("pins.dat"), b"fresh").unwrap();
+        // Legacy settings first, newer flat copy second: flat must survive.
+        std::fs::write(src.join("settings.txt"), b"old").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(base.join("settings.txt"), b"current").unwrap();
+        migrate_from(&src, &base);
+        assert_eq!(std::fs::read(base.join("pins.dat")).unwrap(), b"fresh");
+        assert_eq!(std::fs::read(base.join("settings.txt")).unwrap(), b"current");
+        assert!(!src.exists(), "legacy folder should be gone after a verified copy");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn escape_unescape_roundtrips() {
