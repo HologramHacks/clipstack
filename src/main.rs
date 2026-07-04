@@ -30,8 +30,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
-    EndPaint, FillRect, FrameRect, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
-    ReleaseDC,
+    EndPaint, FillRect, FrameRect, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
     MonitorFromPoint, SelectObject, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor,
     SetWindowRgn, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
     DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
@@ -41,9 +40,6 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptProtectMemory, CryptUnprotectData, CryptUnprotectMemory,
     CRYPTPROTECTMEMORY_SAME_PROCESS, CRYPT_INTEGER_BLOB,
-};
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, RtlCaptureStackBackTrace, EXCEPTION_POINTERS,
 };
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, VirtualLock, VirtualUnlock, GMEM_MOVEABLE,
@@ -235,9 +231,6 @@ struct VRow {
 
 struct App {
     hwnd: HWND,
-    tip_hwnd: HWND,    // small dark tooltip window for the hover hints
-    tip_text: String,  // current tooltip text
-    tip_shown: bool,   // whether the tooltip is currently visible
     hinst: windows_sys::Win32::Foundation::HINSTANCE,
     hook: isize, // WH_MOUSE_LL handle, or 0 when not installed
     history: Vec<Clip>,
@@ -1010,71 +1003,37 @@ fn unescape(s: &str) -> String {
     out
 }
 
-/// Path to a per-user file under %APPDATA%\ClipStack, creating the directory
-/// on demand. One builder for pins, settings, and history.
-/// A filesystem-safe per-machine folder name from the computer name. Clipboard
-/// data is machine-specific, but a roaming profile, or a VM whose AppData is
-/// mapped to the host's, can make even %LOCALAPPDATA% shared between two machines.
-/// Keying the data folder on the computer name keeps each machine's data separate
-/// even inside a shared folder.
-fn machine_id() -> String {
-    let safe: String = std::env::var("COMPUTERNAME")
-        .unwrap_or_default()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    if safe.is_empty() {
-        "default".into()
-    } else {
-        safe
-    }
-}
-
+/// Path to a per-user file under %LOCALAPPDATA%\ClipStack, creating the
+/// directory on demand. One builder for pins, settings, and history.
+/// Local (not Roaming) because clipboard data is machine-specific.
 fn appdata_file(name: &str) -> std::path::PathBuf {
-    // LOCALAPPDATA\ClipStack\<machine>\: Local (not Roaming) because clipboard data
-    // is machine-specific, plus a per-machine subfolder so a shared or VM-mapped
-    // AppData cannot bleed one machine's pins/history into another's.
     let mut p = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     p.push("ClipStack");
-    p.push(machine_id());
     let _ = std::fs::create_dir_all(&p);
     p.push(name);
     p
 }
 
-/// One-time copy of existing data into this machine's per-machine folder. Pulls
-/// from the old flat Local\ClipStack first, then the older Roaming\ClipStack, so
-/// upgrades keep their pins/history. Copies rather than moves, so a second machine
-/// sharing the folder can still find the source for its own migration.
+/// One-time lift of data out of the per-machine subfolder
+/// (ClipStack\<COMPUTERNAME>\) that versions through 0.4.3 used, so
+/// upgrades keep their pins and history. Copies, never overwrites.
 fn migrate_data() {
     let Some(local) = std::env::var_os("LOCALAPPDATA") else {
         return;
     };
     let base = std::path::PathBuf::from(local).join("ClipStack");
-    let dest = base.join(machine_id());
-    let names = ["pins.dat", "history.dat", "settings.txt"];
-    let has = |dir: &std::path::Path| names.iter().any(|n| dir.join(n).exists());
-    if has(&dest) {
-        return; // this machine already has its own data
-    }
-    // Source: the old flat Local folder, else the even older Roaming folder.
-    let mut src = base.clone();
-    if !has(&src) {
-        match std::env::var_os("APPDATA") {
-            Some(r) => src = std::path::PathBuf::from(r).join("ClipStack"),
-            None => return,
-        }
-    }
-    if !has(&src) {
-        return; // nothing to bring over; fresh start
-    }
-    let _ = std::fs::create_dir_all(&dest);
-    for name in names {
-        let s = src.join(name);
-        if s.exists() {
-            let _ = std::fs::copy(&s, dest.join(name));
+    let sub: String = std::env::var("COMPUTERNAME")
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let src = base.join(if sub.is_empty() { "default".to_string() } else { sub });
+    for name in ["pins.dat", "history.dat", "settings.txt"] {
+        let (s, d) = (src.join(name), base.join(name));
+        if s.exists() && !d.exists() {
+            let _ = std::fs::copy(&s, d);
         }
     }
 }
@@ -1364,71 +1323,6 @@ fn row_at(a: &App, y: i32) -> Option<usize> {
     None
 }
 
-unsafe extern "system" fn tip_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if msg == WM_PAINT {
-        let (text, font) = {
-            let a = app();
-            (wide_no_nul(&a.tip_text), a.font)
-        };
-        let mut ps: PAINTSTRUCT = std::mem::zeroed();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        let mut rc: RECT = std::mem::zeroed();
-        GetClientRect(hwnd, &mut rc);
-        fill_color(hdc, 0, 0, rc.right, rc.bottom, theme().field_bg);
-        let oldf = SelectObject(hdc, font as _);
-        SetBkMode(hdc, TRANSPARENT as i32);
-        SetTextColor(hdc, theme().text);
-        DrawTextW(
-            hdc,
-            text.as_ptr(),
-            text.len() as i32,
-            &mut rc,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        );
-        SelectObject(hdc, oldf);
-        let border = CreateSolidBrush(theme().accent);
-        FrameRect(hdc, &rc, border);
-        DeleteObject(border as _);
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-    DefWindowProcW(hwnd, msg, wp, lp)
-}
-
-/// Show the dark hint tooltip with `text`, sitting just left of the cursor.
-unsafe fn show_tip(a: &mut App, text: &str, sx: i32, sy: i32) {
-    if a.tip_hwnd.is_null() {
-        return;
-    }
-    let changed = a.tip_text != text;
-    if changed {
-        a.tip_text = text.to_string();
-    }
-    let w16 = wide_no_nul(text);
-    let dc = GetDC(a.tip_hwnd);
-    let oldf = SelectObject(dc, a.font as _);
-    let mut sz: SIZE = std::mem::zeroed();
-    GetTextExtentPoint32W(dc, w16.as_ptr(), w16.len() as i32, &mut sz);
-    SelectObject(dc, oldf);
-    ReleaseDC(a.tip_hwnd, dc);
-    let w = sz.cx + a.pad * 4;
-    let h = a.item_h;
-    let x = (sx - w - a.pad * 2).max(0);
-    let y = (sy - h / 2).max(0);
-    SetWindowPos(a.tip_hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    if changed || !a.tip_shown {
-        InvalidateRect(a.tip_hwnd, null(), 1);
-    }
-    a.tip_shown = true;
-}
-
-unsafe fn hide_tip(a: &mut App) {
-    if a.tip_shown {
-        ShowWindow(a.tip_hwnd, SW_HIDE);
-        a.tip_shown = false;
-    }
-}
-
 fn show_popup(a: &mut App, cx: i32, cy: i32) {
     if a.history.is_empty() && a.pins.is_empty() {
         return;
@@ -1571,10 +1465,7 @@ fn hide_popup(a: &mut App) {
     a.caret_on = false;
     a.about = false;
     a.toast = None;
-    unsafe {
-        hide_tip(a);
-        ShowWindow(a.hwnd, SW_HIDE)
-    };
+    unsafe { ShowWindow(a.hwnd, SW_HIDE) };
     a.visible = false;
     a.hovered = -1;
     a.arm_delete = -1;
@@ -2171,24 +2062,12 @@ fn key_input(vk: u16, up: bool) -> INPUT {
     }
 }
 
-fn send_paste() {
+/// Synthesize a Ctrl+<vk> chord: 'V' to paste, 'C' to copy (auto-copy).
+fn send_combo(vk: u16) {
     let inputs = [
         key_input(VK_CONTROL, false),
-        key_input(0x56, false), // 'V'
-        key_input(0x56, true),
-        key_input(VK_CONTROL, true),
-    ];
-    unsafe {
-        SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
-    }
-}
-
-/// Synthesize Ctrl+C to copy the current selection (used by auto-copy).
-fn send_copy() {
-    let inputs = [
-        key_input(VK_CONTROL, false),
-        key_input(0x43, false), // 'C'
-        key_input(0x43, true),
+        key_input(vk, false),
+        key_input(vk, true),
         key_input(VK_CONTROL, true),
     ];
     unsafe {
@@ -2562,7 +2441,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_APP_AUTOCOPY => {
-            send_copy(); // copy the just-released selection; the timer poll ingests it
+            send_combo(0x43); // Ctrl+C: copy the just-released selection; the timer poll ingests it
             0
         }
         WM_APP_SCROLL => {
@@ -2635,7 +2514,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if a.edit.is_some() {
                 return 0; // no hover changes while a label field is open
             }
-            let (x, y) = lo_hi(lp);
+            let (_, y) = lo_hi(lp);
             if !a.tracking_leave {
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -2662,18 +2541,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                 }
             }
-            // Tooltip: hint the reorder gesture when hovering a pin's arrows.
-            let over_arrows = !a.about
-                && row >= 0
-                && matches!(a.rows[row as usize].kind, RowKind::Pin(_))
-                && x >= a.width - a.item_h * 2
-                && x < a.width - a.item_h;
-            if over_arrows {
-                let (sx, sy) = (a.popup_x + x, a.popup_y + y);
-                show_tip(&mut a, "Click to move, Shift+click for top/bottom", sx, sy);
-            } else {
-                hide_tip(&mut a);
-            }
             0
         }
         WM_MOUSELEAVE => {
@@ -2681,7 +2548,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             a.hovered = -1;
             a.arm_delete = -1; // disarm any pending pin-delete on leave
             a.tracking_leave = false;
-            hide_tip(&mut a);
             InvalidateRect(hwnd, null(), 1);
             0
         }
@@ -2764,7 +2630,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Act::Paste(target) if !target.is_null() => {
                     SetForegroundWindow(target);
                     std::thread::sleep(Duration::from_millis(40));
-                    send_paste();
+                    send_combo(0x56); // Ctrl+V
                 }
                 Act::Pin(i) => start_pin(i),
                 Act::MovePin(j, up, to_end) => move_pin(j, up, to_end),
@@ -3114,32 +2980,10 @@ fn log_crash(detail: &str) {
     }
 }
 
-/// First-chance vectored handler: on an access violation, log the faulting
-/// address and a raw stack backtrace as offsets from the clipstack module base,
-/// then let the crash proceed (resolve the offsets later with `addr2line -e`).
-/// This catches hard faults the Rust panic hook cannot see, including ones that
-/// occur inside a window-procedure callback.
-unsafe extern "system" fn crash_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
-    let rec = (*info).ExceptionRecord;
-    if (*rec).ExceptionCode as u32 == 0xC0000005 {
-        let base = GetModuleHandleW(null()) as usize;
-        let mut frames = [null_mut::<core::ffi::c_void>(); 48];
-        let n = RtlCaptureStackBackTrace(0, 48, frames.as_mut_ptr(), null_mut());
-        let fault = ((*rec).ExceptionAddress as usize).wrapping_sub(base);
-        let mut s = format!("ACCESS_VIOLATION at clipstack+{fault:#x}\n");
-        for f in frames.iter().take(n as usize) {
-            s.push_str(&format!("  +{:#x}\n", (*f as usize).wrapping_sub(base)));
-        }
-        log_crash(&s);
-    }
-    0 // EXCEPTION_CONTINUE_SEARCH
-}
-
 fn main() {
     std::panic::set_hook(Box::new(|info| log_crash(&info.to_string())));
-    migrate_data(); // pull existing data into this machine's per-machine folder
+    migrate_data(); // one-time lift from the old per-machine subfolder
     unsafe {
-        AddVectoredExceptionHandler(1, Some(crash_veh)); // capture hard-fault stacks
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let hinst = GetModuleHandleW(null());
 
@@ -3168,9 +3012,6 @@ fn main() {
 
         *G.0.borrow_mut() = Some(App {
             hwnd: null_mut(),
-            tip_hwnd: null_mut(),
-            tip_text: String::new(),
-            tip_shown: false,
             hinst,
             hook: 0,
             history,
@@ -3225,39 +3066,6 @@ fn main() {
             null(),
         );
         app().hwnd = hwnd;
-
-        // Tooltip window: a small dark popup for the hover hints.
-        let tip_class = wide("ClipStackTip");
-        {
-            let wc = WNDCLASSW {
-                style: CS_DROPSHADOW,
-                lpfnWndProc: Some(tip_wndproc),
-                cbClsExtra: 0,
-                cbWndExtra: 0,
-                hInstance: hinst,
-                hIcon: null_mut(),
-                hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-                hbrBackground: null_mut(),
-                lpszMenuName: null(),
-                lpszClassName: tip_class.as_ptr(),
-            };
-            RegisterClassW(&wc);
-        }
-        let tip_hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            tip_class.as_ptr(),
-            wide("").as_ptr(),
-            WS_POPUP,
-            0,
-            0,
-            10,
-            10,
-            null_mut(),
-            null_mut(),
-            hinst,
-            null(),
-        );
-        app().tip_hwnd = tip_hwnd;
 
         add_tray(hwnd);
         poll_clip(&mut app()); // seed with whatever's on the clipboard now
