@@ -1654,7 +1654,7 @@ unsafe fn draw_x(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
 unsafe fn draw_pin(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, item_h: i32) {
     let face = wide("Segoe MDL2 Assets");
     let f = CreateFontW(
-        -(item_h * 12 / 34), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0,
+        -(item_h * 12 / 28), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0,
         DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32, 0, CLEARTYPE_QUALITY as u32, 0,
         face.as_ptr(),
     );
@@ -1668,8 +1668,16 @@ unsafe fn draw_pin(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, item_
 
 /// Stacked up/down move arrows (green) on a hovered pin: click the upper half
 /// to move it up, the lower half to move it down, so favorites float to the top.
-unsafe fn draw_updown(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
+unsafe fn draw_updown(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, item_h: i32) {
     let mid = (top + bottom) / 2;
+    // A touch smaller than the row text so the filled triangles don't read chunky.
+    let face = wide("Segoe UI");
+    let f = CreateFontW(
+        -(item_h * 11 / 28), 0, 0, 0, FW_NORMAL as i32, 0, 0, 0,
+        DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32, 0, CLEARTYPE_QUALITY as u32, 0,
+        face.as_ptr(),
+    );
+    let old = SelectObject(hdc, f as _);
     SetTextColor(hdc, theme().accent);
     let up = wide_no_nul("\u{25B2}");
     let mut tr = RECT { left, top, right, bottom: mid };
@@ -1677,6 +1685,8 @@ unsafe fn draw_updown(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
     let down = wide_no_nul("\u{25BC}");
     let mut td = RECT { left, top: mid, right, bottom };
     DrawTextW(hdc, down.as_ptr(), down.len() as i32, &mut td, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(hdc, old);
+    DeleteObject(f as _);
 }
 
 /// A super-subtle 2px scroll thumb on the right edge of an overflowing section,
@@ -2057,7 +2067,7 @@ unsafe fn paint(hwnd: HWND) {
                     SetTextColor(hdc, theme().bg);
                     draw_x(hdc, text_right, r.top, a.width, r.bottom);
                 } else if hovered {
-                    draw_updown(hdc, pin_col, r.top, text_right, r.bottom);
+                    draw_updown(hdc, pin_col, r.top, text_right, r.bottom, a.item_h);
                     SetTextColor(hdc, theme().delete);
                     draw_x(hdc, text_right, r.top, a.width, r.bottom);
                 }
