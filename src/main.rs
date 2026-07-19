@@ -29,7 +29,8 @@ use windows_sys::Win32::Foundation::{
     GlobalFree, LocalFree, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
+    CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
     EndPaint, FillRect, FrameRect, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
     MonitorFromPoint, SelectObject, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor,
     SetWindowRgn, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
@@ -1886,12 +1887,26 @@ unsafe fn paint_about(hdc: HDC, a: &App, rc: &RECT) {
     DeleteObject(border as _);
 }
 
+// Blit the finished back-buffer frame to the window and tear the buffer down.
+unsafe fn present(win: HDC, hdc: HDC, rc: &RECT, oldb: *mut c_void, bmp: *mut c_void) {
+    BitBlt(win, 0, 0, rc.right, rc.bottom, hdc, 0, 0, SRCCOPY);
+    SelectObject(hdc, oldb);
+    DeleteObject(bmp);
+    DeleteDC(hdc);
+}
+
 unsafe fn paint(hwnd: HWND) {
     let a = app();
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
-    let hdc = BeginPaint(hwnd, &mut ps);
+    let win = BeginPaint(hwnd, &mut ps);
     let mut rc: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut rc);
+    // Double buffer: compose the whole frame off-screen, then blit it in one
+    // BitBlt. Painting straight to the window let the monitor catch the moment
+    // between the background fill and the row draws, which flashed on scroll.
+    let hdc = CreateCompatibleDC(win);
+    let bmp = CreateCompatibleBitmap(win, rc.right, rc.bottom);
+    let oldb = SelectObject(hdc, bmp);
 
     fill_color(hdc, 0, 0, rc.right, rc.bottom, theme().bg);
     let oldf = SelectObject(hdc, a.font as _);
@@ -1912,6 +1927,7 @@ unsafe fn paint(hwnd: HWND) {
         let border = CreateSolidBrush(theme().accent);
         FrameRect(hdc, &rc, border);
         DeleteObject(border as _);
+        present(win, hdc, &rc, oldb, bmp);
         EndPaint(hwnd, &ps);
         return;
     }
@@ -1919,6 +1935,7 @@ unsafe fn paint(hwnd: HWND) {
     if a.about {
         paint_about(hdc, &a, &rc);
         SelectObject(hdc, oldf);
+        present(win, hdc, &rc, oldb, bmp);
         EndPaint(hwnd, &ps);
         return;
     }
@@ -2031,6 +2048,7 @@ unsafe fn paint(hwnd: HWND) {
     let border = CreateSolidBrush(theme().sep);
     FrameRect(hdc, &rc, border);
     DeleteObject(border as _);
+    present(win, hdc, &rc, oldb, bmp);
     EndPaint(hwnd, &ps);
 }
 
