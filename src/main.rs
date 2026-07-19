@@ -29,7 +29,7 @@ use windows_sys::Win32::Foundation::{
     GlobalFree, LocalFree, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
+    BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
     CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
     EndPaint, FillRect, FrameRect, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect,
     MonitorFromPoint, SelectObject, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor,
@@ -83,6 +83,7 @@ const WM_APP_HIDE: u32 = WM_APP + 3;
 const WM_APP_SCROLL: u32 = WM_APP + 4; // wparam: 1=up, 2=down
 const WM_APP_CAPTURED: u32 = WM_APP + 5; // wparam=encoded trigger (0=cancel)
 const WM_APP_AUTOCOPY: u32 = WM_APP + 6; // a drag-release: copy the selection
+const WM_APP_FOCUSLOST: u32 = WM_APP + 7; // posted from WM_KILLFOCUS (never inline)
 
 // Tray menu command ids.
 const ID_PAUSE: usize = 101;
@@ -92,6 +93,7 @@ const ID_STARTUP: usize = 104;
 const ID_PERSIST: usize = 105;
 const ID_ABOUT: usize = 106;
 const ID_AUTOCOPY: usize = 107;
+const ID_KBOPEN: usize = 108; // "Open with Ctrl+Shift+V" toggle
 const ID_THEME_BASE: usize = 300; // themes occupy ID_THEME_BASE .. ID_THEME_BASE + THEMES.len()
 
 // HKCU Run-key entry for the optional "launch at startup" toggle.
@@ -102,11 +104,12 @@ const RUN_VALUE: &str = "ClipStack";
 const ID_TRIG_MIDDLE: usize = 201;
 const ID_TRIG_MOUSE4: usize = 202;
 const ID_TRIG_MOUSE5: usize = 203;
-const ID_TRIG_HOTKEY: usize = 204; // the Ctrl+Shift+V preset
 const ID_TRIG_CUSTOM: usize = 205; // "Set custom trigger…" / current custom
 
 /// RegisterHotKey id for whichever keyboard combo is the active trigger.
 const ID_HOTKEY: i32 = 1;
+/// RegisterHotKey id for the always-available Ctrl+Shift+V opener.
+const ID_HOTKEY_NAV: i32 = 2;
 
 // Our own modifier bitmask (independent of the Win32 MOD_* flags).
 const M_CTRL: u8 = 1;
@@ -209,12 +212,12 @@ impl Trigger {
 }
 
 /// The trigger presets, defined once and used by the tray submenu, the radio
-/// check, and the command handler, so they can't drift out of sync.
-const PRESETS: [(usize, Trigger, &str); 4] = [
+/// check, and the command handler, so they can't drift out of sync. Ctrl+Shift+V
+/// is no longer a preset: it is always available as its own opener (kb_open).
+const PRESETS: [(usize, Trigger, &str); 3] = [
     (ID_TRIG_MIDDLE, Trigger::MIDDLE, "Middle click"),
     (ID_TRIG_MOUSE4, Trigger::MOUSE4, "Mouse 4 (back)"),
     (ID_TRIG_MOUSE5, Trigger::MOUSE5, "Mouse 5 (forward)"),
-    (ID_TRIG_HOTKEY, Trigger::HOTKEY, "Ctrl + Shift + V (keyboard)"),
 ];
 
 #[derive(Clone, Copy)]
@@ -250,6 +253,9 @@ struct App {
     visible: bool,
     trigger: Trigger,
     hotkey_active: bool,  // a keyboard trigger is currently registered
+    kb_open: bool,        // setting: Ctrl+Shift+V always opens the popup (default on)
+    nav_active: bool,     // the Ctrl+Shift+V opener is currently registered
+    kb_focus: bool,       // popup was opened via hotkey and holds keyboard focus
     capturing: bool,      // listening for a custom trigger
     about: bool,          // showing the About panel
     toast: Option<String>, // transient inline message at the bottom of the popup
@@ -1131,22 +1137,24 @@ fn trigger_line(t: Trigger) -> String {
     }
 }
 
-fn save_settings(trigger: Trigger, persist: bool, auto_copy: bool, theme_idx: usize) {
-    let mut s = trigger_line(trigger);
-    s.push_str(if persist { "persist=1\n" } else { "persist=0\n" });
-    s.push_str(if auto_copy { "autocopy=1\n" } else { "autocopy=0\n" });
+fn save_settings(a: &App) {
+    let mut s = trigger_line(a.trigger);
+    s.push_str(if a.persist { "persist=1\n" } else { "persist=0\n" });
+    s.push_str(if a.auto_copy { "autocopy=1\n" } else { "autocopy=0\n" });
+    s.push_str(if a.kb_open { "kbopen=1\n" } else { "kbopen=0\n" });
     s.push_str(&format!(
         "theme={}\n",
-        THEMES.get(theme_idx).map_or("Dark", |t| t.0)
+        THEMES.get(a.theme_idx).map_or("Dark", |t| t.0)
     ));
     let _ = std::fs::write(appdata_file("settings.txt"), s);
 }
 
-fn load_settings() -> (Trigger, bool, bool, usize) {
+fn load_settings() -> (Trigger, bool, bool, usize, bool) {
     let mut trigger = Trigger::MIDDLE;
     let mut persist = false;
     let mut auto_copy = false;
     let mut theme_idx = 0;
+    let mut kb_open = true;
     if let Ok(text) = std::fs::read_to_string(appdata_file("settings.txt")) {
         for line in text.lines() {
             let line = line.trim();
@@ -1178,6 +1186,8 @@ fn load_settings() -> (Trigger, bool, bool, usize) {
                 persist = v.trim() == "1";
             } else if let Some(v) = line.strip_prefix("autocopy=") {
                 auto_copy = v.trim() == "1";
+            } else if let Some(v) = line.strip_prefix("kbopen=") {
+                kb_open = v.trim() == "1";
             } else if let Some(v) = line.strip_prefix("theme=") {
                 if let Some(i) = THEMES.iter().position(|t| t.0 == v.trim()) {
                     theme_idx = i;
@@ -1185,7 +1195,13 @@ fn load_settings() -> (Trigger, bool, bool, usize) {
             }
         }
     }
-    (trigger, persist, auto_copy, theme_idx)
+    if trigger == Trigger::HOTKEY {
+        // Migration: Ctrl+Shift+V used to be a trigger preset; it is now the
+        // always-on opener, so a settings file still naming it as the trigger
+        // would double-register the combo. Fall back to the middle button.
+        trigger = Trigger::MIDDLE;
+    }
+    (trigger, persist, auto_copy, theme_idx, kb_open)
 }
 
 // ---- History persistence (opt-in, DPAPI-encrypted) ------------------------
@@ -1354,6 +1370,76 @@ fn row_at(a: &App, y: i32) -> Option<usize> {
     None
 }
 
+/// Screen position of the text caret in `target`'s thread, or the mouse cursor
+/// when no caret is exposed (many apps draw their own). Keyboard-opened popups
+/// use this so the list appears where the user is typing, not where the mouse
+/// happens to be parked.
+unsafe fn caret_or_cursor(target: HWND) -> (i32, i32) {
+    let mut gti: GUITHREADINFO = std::mem::zeroed();
+    gti.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+    // Null target would make GetGUIThreadInfo(0) report some other thread's
+    // caret; skip straight to the cursor instead.
+    let tid = if target.is_null() { 0 } else { GetWindowThreadProcessId(target, null_mut()) };
+    if tid != 0 && GetGUIThreadInfo(tid, &mut gti) != 0 && !gti.hwndCaret.is_null() {
+        let mut pt = POINT { x: gti.rcCaret.left, y: gti.rcCaret.bottom };
+        ClientToScreen(gti.hwndCaret, &mut pt);
+        return (pt.x, pt.y + 4); // nudge below the text line
+    }
+    let mut pt: POINT = std::mem::zeroed();
+    GetCursorPos(&mut pt);
+    (pt.x, pt.y)
+}
+
+/// One Up/Down step through the visible rows: the new selection plus history
+/// and pin scroll deltas (each -1, 0, or 1). At a section edge the section
+/// scrolls first (revealing the next item under a fixed selection); only past
+/// its true end does the selection cross into the neighboring section.
+/// `can_scroll_*` say whether that section has one more item in the direction
+/// of travel.
+fn nav_step(
+    rows: &[VRow],
+    hovered: i32,
+    down: bool,
+    can_scroll_hist: bool,
+    can_scroll_pins: bool,
+) -> (i32, i32, i32) {
+    let sel_ok = |i: usize| !matches!(rows[i].kind, RowKind::Sep);
+    let cur = match usize::try_from(hovered).ok().filter(|&i| i < rows.len() && sel_ok(i)) {
+        Some(i) => i,
+        None => {
+            // Nothing selected yet: enter the list at the near end.
+            let first = if down {
+                (0..rows.len()).find(|&i| sel_ok(i))
+            } else {
+                (0..rows.len()).rev().find(|&i| sel_ok(i))
+            };
+            return (first.map_or(-1, |i| i as i32), 0, 0);
+        }
+    };
+    let step = |from: usize| {
+        if down {
+            (from + 1..rows.len()).find(|&i| sel_ok(i))
+        } else {
+            (0..from).rev().find(|&i| sel_ok(i))
+        }
+    };
+    let in_hist = matches!(rows[cur].kind, RowKind::Hist(_));
+    let at_edge = match step(cur) {
+        None => true,
+        Some(j) => matches!(rows[j].kind, RowKind::Hist(_)) != in_hist,
+    };
+    if at_edge {
+        let d = if down { 1 } else { -1 };
+        if in_hist && can_scroll_hist {
+            return (cur as i32, d, 0);
+        }
+        if !in_hist && can_scroll_pins {
+            return (cur as i32, 0, d);
+        }
+    }
+    (step(cur).map_or(cur as i32, |j| j as i32), 0, 0)
+}
+
 fn show_popup(a: &mut App, cx: i32, cy: i32) {
     if a.history.is_empty() && a.pins.is_empty() {
         return;
@@ -1492,6 +1578,11 @@ fn hide_popup(a: &mut App) {
         unsafe {
             set_no_activate(a.hwnd, true);
         }
+    }
+    if a.kb_focus {
+        // Keyboard-opened popup held real focus; give the style back too.
+        a.kb_focus = false;
+        unsafe { set_no_activate(a.hwnd, true) };
     }
     a.caret_on = false;
     a.about = false;
@@ -2156,6 +2247,10 @@ unsafe fn end_edit(commit: bool) {
         }
         scrub_string(&mut ed.secret); // no-op if the secret was moved into the pin
         a.caret_on = false;
+        // Focus is about to go back to the origin app, so a keyboard-opened
+        // popup no longer holds it; without this the posted WM_APP_FOCUSLOST
+        // would dismiss the popup instead of leaving the new pin visible.
+        a.kb_focus = false;
         relayout(&mut a); // resize for the (possibly) new pin and repaint
         (a.hwnd, ed.restore)
     };
@@ -2198,6 +2293,19 @@ unsafe fn reconcile_input(a: &mut App) {
         UnregisterHotKey(a.hwnd, ID_HOTKEY);
         a.hotkey_active = false;
     }
+
+    // The always-available keyboard opener (independent of the trigger above).
+    let want_nav = !a.paused && a.kb_open;
+    if want_nav && !a.nav_active {
+        if let Trigger::Key { vk, mods } = Trigger::HOTKEY {
+            if RegisterHotKey(a.hwnd, ID_HOTKEY_NAV, to_win32_mods(mods) | MOD_NOREPEAT, vk) != 0 {
+                a.nav_active = true;
+            }
+        }
+    } else if !want_nav && a.nav_active {
+        UnregisterHotKey(a.hwnd, ID_HOTKEY_NAV);
+        a.nav_active = false;
+    }
 }
 
 /// Tell the user a keyboard combo couldn't be claimed (already in use).
@@ -2211,7 +2319,7 @@ unsafe fn warn_hotkey_taken(hwnd: HWND) {
 /// If a keyboard combo can't be registered (already taken), roll back so we
 /// never persist or leave the user on a dead trigger.
 unsafe fn set_trigger(t: Trigger) {
-    let (hwnd, desc, ok) = {
+    let (hwnd, ok) = {
         let mut a = app();
         if a.trigger == t {
             return;
@@ -2222,18 +2330,27 @@ unsafe fn set_trigger(t: Trigger) {
         if t.is_key() && !a.hotkey_active {
             a.trigger = prev;
             reconcile_input(&mut a);
-            (a.hwnd, prev.describe(), false)
+            (a.hwnd, false)
         } else {
-            (a.hwnd, t.describe(), true)
+            (a.hwnd, true)
         }
     };
+    let desc = open_desc(&app());
     update_tray_tip(hwnd, &desc);
     if ok {
-        let (persist, auto_copy, theme_idx) =
-            { let a = app(); (a.persist, a.auto_copy, a.theme_idx) };
-        save_settings(t, persist, auto_copy, theme_idx);
+        save_settings(&app());
     } else {
         warn_hotkey_taken(hwnd);
+    }
+}
+
+/// Tray-tip description of every way to open the popup. Skips the "or" when a
+/// custom trigger IS Ctrl+Shift+V, so the tip never reads "X or X".
+fn open_desc(a: &App) -> String {
+    if a.kb_open && a.trigger != Trigger::HOTKEY {
+        format!("{} or Ctrl+Shift+V", a.trigger.describe())
+    } else {
+        a.trigger.describe()
     }
 }
 
@@ -2335,14 +2452,10 @@ unsafe fn finish_capture(new: Option<Trigger>) {
         } else {
             reconcile_input(&mut a);
         }
-        (a.hwnd, a.target, a.trigger.describe(), failed)
+        (a.hwnd, a.target, open_desc(&a), failed)
     };
-    if let Some(t) = new {
-        if !failed {
-            let (persist, auto_copy, theme_idx) =
-                { let a = app(); (a.persist, a.auto_copy, a.theme_idx) };
-            save_settings(t, persist, auto_copy, theme_idx);
-        }
+    if new.is_some() && !failed {
+        save_settings(&app());
     }
     if !restore.is_null() {
         SetForegroundWindow(restore);
@@ -2600,14 +2713,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_KILLFOCUS => {
-            // We only ever hold focus during capture or inline-edit; if we lose
-            // it (e.g. the user alt-tabs away mid-capture), post a cancel so
-            // capture can't get wedged. It MUST be posted, not handled inline:
-            // WM_KILLFOCUS can arrive synchronously while the App borrow is held
-            // (ShowWindow(SW_HIDE) on the focused window), so touching app() here
-            // would re-borrow and panic. The posted cancel is a no-op unless a
-            // capture is actually in progress.
-            PostMessageW(hwnd, WM_APP_CAPTURED, 0, 0);
+            // We only hold focus during capture, inline-edit, or keyboard nav;
+            // losing it (click-away, alt-tab) posts a cleanup. It MUST be
+            // posted, not handled inline: WM_KILLFOCUS can arrive synchronously
+            // while the App borrow is held (ShowWindow(SW_HIDE) on the focused
+            // window), so touching app() here would re-borrow and panic.
+            PostMessageW(hwnd, WM_APP_FOCUSLOST, 0, 0);
+            0
+        }
+        WM_APP_FOCUSLOST => {
+            if app().capturing {
+                finish_capture(None); // don't leave capture wedged
+            } else {
+                let mut a = app();
+                if a.visible && a.kb_focus && a.edit.is_none() {
+                    // Keyboard-opened popup lost focus: dismiss like a click-away.
+                    hide_popup(&mut a);
+                }
+            }
             0
         }
         WM_LBUTTONUP => {
@@ -2719,6 +2842,94 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 return 0;
             }
+            // Keyboard navigation: only reachable when the popup holds focus,
+            // which only a hotkey-open grants (mouse-opened popups never get keys).
+            if msg == WM_KEYDOWN && {
+                let a = app();
+                a.visible && a.edit.is_none() && !a.about && a.kb_focus
+            } {
+                enum KAct {
+                    None,
+                    Paste(HWND),
+                    Dismiss(HWND),
+                }
+                let act = {
+                    let mut a = app();
+                    match wp as u16 {
+                        0x26 | 0x28 => {
+                            // VK_UP / VK_DOWN
+                            let down = wp as u16 == 0x28;
+                            let (can_h, can_p) = if down {
+                                (
+                                    a.scroll + VISIBLE < a.history.len(),
+                                    a.pin_scroll + PIN_VISIBLE < a.pins.len(),
+                                )
+                            } else {
+                                (a.scroll > 0, a.pin_scroll > 0)
+                            };
+                            let (sel, dh, dp) = nav_step(&a.rows, a.hovered, down, can_h, can_p);
+                            if dh != 0 || dp != 0 {
+                                a.scroll = (a.scroll as i32 + dh) as usize;
+                                a.pin_scroll = (a.pin_scroll as i32 + dp) as usize;
+                                rebuild_rows(&mut a);
+                            }
+                            a.hovered = sel;
+                            InvalidateRect(hwnd, null(), 0);
+                            KAct::None
+                        }
+                        0x09 => {
+                            // VK_TAB: jump between the history and pin sections.
+                            let in_pins = usize::try_from(a.hovered)
+                                .ok()
+                                .and_then(|i| a.rows.get(i))
+                                .is_some_and(|r| matches!(r.kind, RowKind::Pin(_)));
+                            let jump = a.rows.iter().position(|r| {
+                                if in_pins {
+                                    matches!(r.kind, RowKind::Hist(_))
+                                } else {
+                                    matches!(r.kind, RowKind::Pin(_))
+                                }
+                            });
+                            if let Some(j) = jump {
+                                a.hovered = j as i32;
+                                InvalidateRect(hwnd, null(), 0);
+                            }
+                            KAct::None
+                        }
+                        0x0D => {
+                            // VK_RETURN: paste the selected row into the app the
+                            // user came from.
+                            let idx = usize::try_from(a.hovered)
+                                .ok()
+                                .filter(|&i| i < a.rows.len())
+                                .filter(|&i| !matches!(a.rows[i].kind, RowKind::Sep));
+                            match idx {
+                                Some(i) => KAct::Paste(commit_row(&mut a, i)),
+                                None => KAct::None,
+                            }
+                        }
+                        0x1B => {
+                            // VK_ESCAPE: dismiss, hand focus back untouched.
+                            let restore = a.target;
+                            hide_popup(&mut a);
+                            KAct::Dismiss(restore)
+                        }
+                        _ => KAct::None,
+                    }
+                };
+                match act {
+                    KAct::Paste(target) if !target.is_null() => {
+                        SetForegroundWindow(target);
+                        std::thread::sleep(Duration::from_millis(40));
+                        send_combo(0x56); // Ctrl+V
+                    }
+                    KAct::Dismiss(restore) if !restore.is_null() => {
+                        SetForegroundWindow(restore);
+                    }
+                    _ => {}
+                }
+                return 0;
+            }
             if msg == WM_KEYDOWN && app().edit.is_some() {
                 match wp as u16 {
                     0x1B => end_edit(false), // VK_ESCAPE: cancel
@@ -2779,12 +2990,52 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_HOTKEY => {
-            let mut a = app();
-            if !a.visible && !a.paused && !a.capturing {
-                a.target = GetForegroundWindow();
-                let mut pt: POINT = std::mem::zeroed();
-                GetCursorPos(&mut pt);
-                show_popup(&mut a, pt.x, pt.y);
+            enum HAct {
+                None,
+                Focus(HWND),   // popup opened: grab keyboard focus for nav
+                Dismiss(HWND), // hotkey while open acts as a toggle
+            }
+            let act = {
+                let mut a = app();
+                if a.paused || a.capturing {
+                    HAct::None
+                } else if a.visible {
+                    let restore = a.target;
+                    hide_popup(&mut a);
+                    HAct::Dismiss(restore)
+                } else {
+                    a.target = GetForegroundWindow();
+                    let (x, y) = caret_or_cursor(a.target);
+                    show_popup(&mut a, x, y);
+                    if a.visible {
+                        // Start the selection on the first row so arrows work
+                        // immediately.
+                        a.hovered = a
+                            .rows
+                            .iter()
+                            .position(|r| !matches!(r.kind, RowKind::Sep))
+                            .map_or(-1, |i| i as i32);
+                        a.kb_focus = true;
+                        HAct::Focus(a.hwnd)
+                    } else {
+                        HAct::None // nothing to show (empty history + pins)
+                    }
+                }
+            };
+            // Focus calls outside the borrow: they can deliver messages
+            // synchronously (see the WM_KILLFOCUS lesson).
+            match act {
+                HAct::Focus(hwnd2) => {
+                    set_no_activate(hwnd2, false);
+                    SetForegroundWindow(hwnd2);
+                    SetFocus(hwnd2);
+                }
+                HAct::Dismiss(restore) => {
+                    if !restore.is_null() {
+                        SetForegroundWindow(restore);
+                    }
+                }
+                HAct::None => {}
             }
             0
         }
@@ -2831,7 +3082,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_PERSIST => {
                     let mut a = app();
                     a.persist = !a.persist;
-                    save_settings(a.trigger, a.persist, a.auto_copy, a.theme_idx);
+                    save_settings(&a);
                     if a.persist {
                         save_history(&a); // capture what's already in memory
                     } else {
@@ -2841,8 +3092,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_AUTOCOPY => {
                     let mut a = app();
                     a.auto_copy = !a.auto_copy;
-                    save_settings(a.trigger, a.persist, a.auto_copy, a.theme_idx);
+                    save_settings(&a);
                     reconcile_input(&mut a); // install/remove the hook for drag-watching
+                }
+                ID_KBOPEN => {
+                    let (hwnd2, failed) = {
+                        let mut a = app();
+                        a.kb_open = !a.kb_open;
+                        reconcile_input(&mut a);
+                        save_settings(&a);
+                        // While paused nothing registers by design, that's not
+                        // a conflict.
+                        (a.hwnd, a.kb_open && !a.paused && !a.nav_active)
+                    };
+                    let desc = open_desc(&app());
+                    update_tray_tip(hwnd2, &desc);
+                    if failed {
+                        // Another app owns Ctrl+Shift+V; the setting stays on and
+                        // registration retries on the next resume/toggle.
+                        warn_hotkey_taken(hwnd2);
+                    }
                 }
                 ID_TRIG_CUSTOM => start_capture(),
                 cmd => {
@@ -2852,7 +3121,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         let mut a = app();
                         a.theme_idx = cmd - ID_THEME_BASE;
                         set_theme(a.theme_idx);
-                        save_settings(a.trigger, a.persist, a.auto_copy, a.theme_idx);
+                        save_settings(&a);
                         InvalidateRect(a.hwnd, null(), 1); // repaint in the new theme
                     }
                 }
@@ -2869,9 +3138,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 unsafe fn show_tray_menu(hwnd: HWND) {
-    let (paused, trigger, persist, auto_copy, theme_idx) = {
+    let (paused, trigger, persist, auto_copy, theme_idx, kb_open) = {
         let a = app();
-        (a.paused, a.trigger, a.persist, a.auto_copy, a.theme_idx)
+        (a.paused, a.trigger, a.persist, a.auto_copy, a.theme_idx, a.kb_open)
     };
     let mut pt: POINT = std::mem::zeroed();
     GetCursorPos(&mut pt);
@@ -2912,6 +3181,11 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         autocopy_flags |= MF_CHECKED;
     }
     AppendMenuW(menu, autocopy_flags, ID_AUTOCOPY, wide("Auto-copy on highlight").as_ptr());
+    let mut kbopen_flags = MF_STRING;
+    if kb_open {
+        kbopen_flags |= MF_CHECKED;
+    }
+    AppendMenuW(menu, kbopen_flags, ID_KBOPEN, wide("Open with Ctrl+Shift+V").as_ptr());
     // Theme submenu, radio-checked on the active theme.
     let theme_sub = CreatePopupMenu();
     for (i, (name, _)) in THEMES.iter().enumerate() {
@@ -2968,7 +3242,7 @@ unsafe fn add_tray(hwnd: HWND) {
     let cx = GetSystemMetrics(SM_CXSMICON);
     let cy = GetSystemMetrics(SM_CYSMICON);
     nid.hIcon = load_app_icon(cx, cy);
-    let desc = app().trigger.describe();
+    let desc = open_desc(&app());
     set_tip(&mut nid, &desc);
     Shell_NotifyIconW(NIM_ADD, &nid);
 }
@@ -2988,6 +3262,10 @@ unsafe fn cleanup(hwnd: HWND) {
     if a.hotkey_active {
         UnregisterHotKey(hwnd, ID_HOTKEY);
         a.hotkey_active = false;
+    }
+    if a.nav_active {
+        UnregisterHotKey(hwnd, ID_HOTKEY_NAV);
+        a.nav_active = false;
     }
     if !a.font.is_null() {
         DeleteObject(a.font as _);
@@ -3054,7 +3332,7 @@ fn main() {
         }
 
         let pins = load_pins();
-        let (trigger, persist, auto_copy, theme_idx) = load_settings();
+        let (trigger, persist, auto_copy, theme_idx, kb_open) = load_settings();
         set_theme(theme_idx);
         let history = if persist { load_history() } else { Vec::new() };
 
@@ -3078,6 +3356,9 @@ fn main() {
             visible: false,
             trigger,
             hotkey_active: false,
+            kb_open,
+            nav_active: false,
+            kb_focus: false,
             capturing: false,
             about: false,
             toast: None,
@@ -3175,6 +3456,55 @@ mod tests {
     fn escape_emits_no_raw_control_chars() {
         let e = escape("a\nb\tc\rd");
         assert!(!e.contains('\n') && !e.contains('\t') && !e.contains('\r'));
+    }
+
+    /// `h` history rows, then (if `p > 0`) a separator and `p` pin rows,
+    /// mirroring rebuild_rows' layout. Row heights don't matter to nav_step.
+    fn nav_rows(h: usize, p: usize) -> Vec<VRow> {
+        let mut rows: Vec<VRow> = (0..h)
+            .map(|i| VRow { kind: RowKind::Hist(i), top: 0, bottom: 0 })
+            .collect();
+        if p > 0 {
+            rows.push(VRow { kind: RowKind::Sep, top: 0, bottom: 0 });
+            rows.extend((0..p).map(|j| VRow { kind: RowKind::Pin(j), top: 0, bottom: 0 }));
+        }
+        rows
+    }
+
+    #[test]
+    fn nav_enters_at_the_near_end() {
+        let rows = nav_rows(3, 2);
+        assert_eq!(nav_step(&rows, -1, true, false, false), (0, 0, 0)); // Down: first hist
+        assert_eq!(nav_step(&rows, -1, false, false, false), (5, 0, 0)); // Up: last pin
+    }
+
+    #[test]
+    fn nav_steps_within_a_section_and_skips_the_separator() {
+        let rows = nav_rows(3, 2);
+        assert_eq!(nav_step(&rows, 0, true, false, false), (1, 0, 0));
+        assert_eq!(nav_step(&rows, 2, true, false, false), (4, 0, 0)); // hist end -> first pin
+        assert_eq!(nav_step(&rows, 4, false, false, false), (2, 0, 0)); // first pin -> hist end
+    }
+
+    #[test]
+    fn nav_scrolls_a_section_before_leaving_it() {
+        let rows = nav_rows(3, 2);
+        // More history below: Down at the last hist row scrolls, selection stays.
+        assert_eq!(nav_step(&rows, 2, true, true, false), (2, 1, 0));
+        // More history above: Up at the first hist row scrolls up.
+        assert_eq!(nav_step(&rows, 0, false, true, false), (0, -1, 0));
+        // Pins likewise, in both directions.
+        assert_eq!(nav_step(&rows, 5, true, false, true), (5, 0, 1));
+        assert_eq!(nav_step(&rows, 4, false, false, true), (4, 0, -1));
+    }
+
+    #[test]
+    fn nav_stops_at_the_true_ends() {
+        let rows = nav_rows(3, 2);
+        assert_eq!(nav_step(&rows, 5, true, false, false), (5, 0, 0)); // bottom: stay
+        assert_eq!(nav_step(&rows, 0, false, false, false), (0, 0, 0)); // top: stay
+        let hist_only = nav_rows(2, 0);
+        assert_eq!(nav_step(&hist_only, 1, true, false, false), (1, 0, 0));
     }
 
     #[test]
