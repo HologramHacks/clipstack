@@ -157,6 +157,7 @@ struct Edit {
     label: Vec<u16>,       // label typed so far (UTF-16, no NUL)
     restore: HWND,         // foreground window to hand focus back to when done
     rename: Option<usize>, // Some(j) = renaming existing pin j; None = new pin from history
+    preselected: bool,     // pre-filled label shown highlighted: next keystroke replaces it
 }
 
 /// A non-typing mouse button usable as a trigger.
@@ -1752,7 +1753,15 @@ unsafe fn paint_edit_row(hdc: HDC, a: &App, r: &VRow, text_left: i32) {
         let hint = wide_no_nul("Type a label  \u{2014}  Enter to pin, Esc to cancel");
         draw_text_row(hdc, text_left + a.pad, r.top, tr, r.bottom, &hint);
     } else {
-        SetTextColor(hdc, theme().strong);
+        if ed.preselected {
+            // Selection highlight behind the pre-filled suggestion: typing
+            // replaces it, Enter keeps it.
+            let w = text_width(hdc, &ed.label);
+            fill_color(hdc, text_left - 1, ctop, (text_left + w + 2).min(tr), cbot, theme().accent);
+            SetTextColor(hdc, theme().bg);
+        } else {
+            SetTextColor(hdc, theme().strong);
+        }
         draw_text_row(hdc, text_left, r.top, tr, r.bottom, &ed.label);
         if a.caret_on {
             let cx = (text_left + text_width(hdc, &ed.label) + 1).min(tr - 2);
@@ -1797,6 +1806,13 @@ unsafe fn open_url(hwnd: HWND, url: &str) {
     ShellExecuteW(hwnd, verb.as_ptr(), u.as_ptr(), null(), null(), SW_SHOWNORMAL);
 }
 
+/// Suggested pin label from the clip text: first line, trimmed, capped short
+/// enough that a pasted blob or key can't become a label by accident.
+fn suggest_label(s: &str) -> String {
+    let line: String = s.lines().next().unwrap_or("").trim().chars().take(40).collect();
+    line.trim_end().to_string()
+}
+
 /// Begin inline pin-labeling for history item `i` (text clips only, up to
 /// MAX_PINS). Shared by the right-click and the pin-glyph click.
 unsafe fn start_pin(i: usize) {
@@ -1812,7 +1828,13 @@ unsafe fn start_pin(i: usize) {
                 _ => unreachable!(),
             };
             let restore = a.target;
-            a.edit = Some(Edit { hist: i, secret, label: Vec::new(), restore, rename: None });
+            // Pre-fill the label from the clip and show it selected: Enter
+            // keeps it, any keystroke replaces it. The name is public (shown
+            // on screen), so replacing is deliberately one keypress cheaper
+            // than keeping, a nudge toward custom labels for sensitive values.
+            let label: Vec<u16> = suggest_label(&secret).encode_utf16().collect();
+            let preselected = !label.is_empty();
+            a.edit = Some(Edit { hist: i, secret, label, restore, rename: None, preselected });
             a.caret_on = true;
             (Some(a.hwnd), false)
         }
@@ -1848,6 +1870,7 @@ unsafe fn start_rename(j: usize) {
                 label,
                 restore,
                 rename: Some(j),
+                preselected: true, // F2 semantics: type to replace, Enter to keep
             });
             a.caret_on = true;
             Some(a.hwnd)
@@ -2957,10 +2980,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             match wp as u16 {
                 0x08 => {
-                    // Backspace: drop the last code unit (plus its surrogate pair).
+                    // Backspace: a preselected label clears whole (it's one
+                    // selection); otherwise drop the last code unit (plus its
+                    // surrogate pair).
                     let mut a = app();
                     if let Some(e) = a.edit.as_mut() {
-                        if let Some(last) = e.label.pop() {
+                        if e.preselected {
+                            e.label.clear();
+                            e.preselected = false;
+                        } else if let Some(last) = e.label.pop() {
                             if (0xDC00..=0xDFFF).contains(&last)
                                 && matches!(e.label.last(), Some(&p) if (0xD800..=0xDBFF).contains(&p)) {
                                     e.label.pop();
@@ -2975,6 +3003,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 c => {
                     let mut a = app();
                     if let Some(e) = a.edit.as_mut() {
+                        if e.preselected {
+                            // First keystroke replaces the preselected suggestion.
+                            e.label.clear();
+                            e.preselected = false;
+                        }
                         if e.label.len() < 200 {
                             e.label.push(c);
                         }
@@ -3456,6 +3489,19 @@ mod tests {
     fn escape_emits_no_raw_control_chars() {
         let e = escape("a\nb\tc\rd");
         assert!(!e.contains('\n') && !e.contains('\t') && !e.contains('\r'));
+    }
+
+    #[test]
+    fn suggest_label_takes_a_short_first_line() {
+        assert_eq!(suggest_label("Aria"), "Aria");
+        assert_eq!(suggest_label("  padded  "), "padded");
+        assert_eq!(suggest_label("first line\nsecond line"), "first line");
+        assert_eq!(suggest_label(""), "");
+        assert_eq!(suggest_label("\n\n"), "");
+        // Capped at 40 chars, no trailing space left by the cut.
+        let long = "word ".repeat(20);
+        let s = suggest_label(&long);
+        assert!(s.chars().count() <= 40 && !s.ends_with(' '), "got {s:?}");
     }
 
     /// `h` history rows, then (if `p > 0`) a separator and `p` pin rows,
