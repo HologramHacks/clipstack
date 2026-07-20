@@ -29,6 +29,7 @@ ClipStack sits in your system tray. Middle-click is the default opener (you can 
 | Action | What happens |
 |---|---|
 | **Middle-click** anywhere | Opens the history popup at your cursor |
+| **Ctrl+Shift+V** anywhere | Opens the popup at your text caret, ready for the keyboard: arrows move, Enter pastes |
 | **Mouse wheel** (popup open) | Scrolls through older clips |
 | **Left-click** a row | Pastes that clip (or pin) into the field you were in |
 | **Click the ✕** on a history clip | Removes it from history (one click) |
@@ -36,11 +37,15 @@ ClipStack sits in your system tray. Middle-click is the default opener (you can 
 | **Right-click** a pin | Renames it (edit the label inline) |
 | **Hover a pin → up/down arrows** | Reorders it: plain click moves one step, Shift+click sends it to the top or bottom |
 | **Click a pin's ✕, then click again** | Deletes the pin. The first click arms a red confirm button so you can't delete by accident |
-| **Right-click the tray icon** | Trigger · Theme (6 of them) · Launch at startup · Remember history · Auto-copy on highlight · Pause · Clear history · About · Quit |
+| **Right-click the tray icon** | Trigger · Theme (6 of them) · Launch at startup · Remember history · Auto-copy on highlight · Open with Ctrl+Shift+V · Pause · Clear history · About · Quit |
+
+### Fully hands-free
+
+Press **Ctrl+Shift+V** while typing and the popup opens right at your caret with the first clip selected. **Up/Down** move through the list (scrolling when you reach the edge), **Tab** jumps between history and pins, **Enter** pastes the selection back into the field you came from, and **Esc** (or pressing the hotkey again) dismisses without touching anything. Tab to your next form field and repeat: no mouse involved at any point. It's always on alongside your mouse trigger; turn it off from the tray if the combo clashes with another app.
 
 ### Changing the trigger
 
-Middle-click is the default, but you can remap it from the tray: **right-click the tray icon → Trigger**. Pick a preset (middle, Mouse 4 / Mouse 5, or **Ctrl+Shift+V**), or choose **Set custom trigger…** and press any modifier+key combo or mouse button. When a mouse button is your trigger, ClipStack takes it over completely, so e.g. a Back/Forward button stops navigating while it's mapped. A keyboard trigger leaves the mouse untouched until you press it (handy if you use the middle/thumb buttons in apps like games or 3D tools). Your choice is remembered across restarts.
+Middle-click is the default, but you can remap it from the tray: **right-click the tray icon → Trigger**. Pick a preset (middle, Mouse 4 / Mouse 5), or choose **Set custom trigger…** and press any modifier+key combo or mouse button. When a mouse button is your trigger, ClipStack takes it over completely, so e.g. a Back/Forward button stops navigating while it's mapped. A keyboard trigger leaves the mouse untouched until you press it (handy if you use the middle/thumb buttons in apps like games or 3D tools). Your choice is remembered across restarts.
 
 > Got a mouse with extra buttons? Windows only exposes five buttons to apps (left, right, middle, and the two thumb buttons), so the rest aren't visible to ClipStack, or any app. Map one to a key combo in your mouse software, then set that combo as a custom trigger.
 
