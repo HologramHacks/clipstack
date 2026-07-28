@@ -31,6 +31,7 @@ ClipStack sits in your system tray. Middle-click is the default opener (you can 
 | **Middle-click** anywhere | Opens the history popup at your cursor |
 | **Ctrl+Shift+V** anywhere | Opens the popup at your text caret, ready for the keyboard: arrows move, Enter pastes |
 | **Mouse wheel** (popup open) | Scrolls through older clips |
+| **Rest on an image clip** (hover or arrow-key selection) | Pops a larger preview beside the popup so lookalike screenshots are tellable apart |
 | **Left-click** a row | Pastes that clip (or pin) into the field you were in |
 | **Click the ✕** on a history clip | Removes it from history (one click) |
 | **Hover a text clip → click the green pin** (or right-click the clip) | Pins it, masked on screen. The label comes pre-filled from the clip, shown selected: Enter keeps it, typing replaces it. Up to 99 pins |

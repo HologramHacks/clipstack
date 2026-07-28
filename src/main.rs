@@ -132,6 +132,7 @@ const M_ALT: u8 = 4;
 const M_WIN: u8 = 8;
 
 const TIMER_CLIP: usize = 1;
+const TIMER_PREVIEW: usize = 2; // one-shot hover delay before the image preview shows
 const HC_ACTION: i32 = 0;
 
 /// App icon (.ico with several sizes), baked into the exe and turned into an
@@ -262,6 +263,8 @@ struct App {
     vis: usize,     // history rows currently visible (dynamic split, set by rebuild_rows)
     pin_vis: usize, // pin rows currently visible
     row_budget: usize, // rows the current monitor can show, capped at TOTAL_VISIBLE
+    preview: Option<(usize, i32, i32, Vec<u8>)>, // shown image preview: hist idx, w, h, BGRA
+    preview_hwnd: HWND, // the (hidden until needed) preview panel beside the popup
     auto_copy: bool,             // opt-in: copy a highlighted selection on drag-release
     drag_start: Option<POINT>,   // left-button-down point, for the drag heuristic
     theme_idx: usize,            // index into THEMES
@@ -586,6 +589,35 @@ fn make_preview(s: &str) -> Vec<u16> {
 
 // ---- Clipboard history ----------------------------------------------------
 
+/// Nearest-neighbor RGBA -> top-down 32bpp BGRA at the given size. Shared by
+/// the row thumbnails and the hover preview.
+// ponytail: nearest sampling; box-filter it if previews look crunchy
+fn scale_bgra(w: usize, h: usize, rgba: &[u8], tw: usize, th: usize) -> Vec<u8> {
+    let mut out = vec![0u8; tw * th * 4];
+    for y in 0..th {
+        let sy = (y * h / th).min(h - 1);
+        for x in 0..tw {
+            let sx = (x * w / tw).min(w - 1);
+            let si = (sy * w + sx) * 4;
+            let di = (y * tw + x) * 4;
+            out[di] = rgba[si + 2]; // B
+            out[di + 1] = rgba[si + 1]; // G
+            out[di + 2] = rgba[si]; // R
+            out[di + 3] = 255;
+        }
+    }
+    out
+}
+
+/// Shrink (never grow) `w x h` so the long edge fits `cap`.
+fn fit_cap(w: usize, h: usize, cap: usize) -> (usize, usize) {
+    if w <= cap && h <= cap {
+        return (w.max(1), h.max(1));
+    }
+    let s = cap as f32 / w.max(h) as f32;
+    (((w as f32 * s) as usize).max(1), ((h as f32 * s) as usize).max(1))
+}
+
 fn make_thumb(w: usize, h: usize, rgba: &[u8]) -> (i32, i32, Vec<u8>) {
     const BASE_H: usize = 40;
     const MAX_W: usize = 120;
@@ -602,19 +634,7 @@ fn make_thumb(w: usize, h: usize, rgba: &[u8]) -> (i32, i32, Vec<u8>) {
     }
     tw = tw.max(1);
     th = th.max(1);
-    let mut out = vec![0u8; tw * th * 4];
-    for y in 0..th {
-        let sy = (y * h / th).min(h - 1);
-        for x in 0..tw {
-            let sx = (x * w / tw).min(w - 1);
-            let si = (sy * w + sx) * 4;
-            let di = (y * tw + x) * 4;
-            out[di] = rgba[si + 2]; // B
-            out[di + 1] = rgba[si + 1]; // G
-            out[di + 2] = rgba[si]; // R
-            out[di + 3] = 255;
-        }
-    }
+    let out = scale_bgra(w, h, rgba, tw, th);
     (tw as i32, th as i32, out)
 }
 
@@ -1458,6 +1478,83 @@ fn nav_step(
     (step(cur).map_or(cur as i32, |j| j as i32), 0, 0)
 }
 
+// ---- Image hover preview ---------------------------------------------------
+
+/// History index of the image clip the hover/selection is resting on, if the
+/// popup is in a state where a preview makes sense.
+fn preview_target(a: &App) -> Option<usize> {
+    if !a.visible || a.about || a.edit.is_some() || a.capturing {
+        return None;
+    }
+    match usize::try_from(a.hovered).ok().and_then(|r| a.rows.get(r))?.kind {
+        RowKind::Hist(i) if matches!(a.history.get(i), Some(Clip::Image(_))) => Some(i),
+        _ => None,
+    }
+}
+
+/// Hide any shown preview and, if an image row is now under the cursor or
+/// selection, arm the one-shot delay timer (SetTimer with the same id also
+/// resets a pending one, which debounces travel across the list).
+unsafe fn queue_preview(a: &mut App) {
+    hide_preview(a);
+    if preview_target(a).is_some() {
+        SetTimer(a.hwnd, TIMER_PREVIEW, 300, None);
+    } else {
+        KillTimer(a.hwnd, TIMER_PREVIEW);
+    }
+}
+
+fn hide_preview(a: &mut App) {
+    if a.preview.take().is_some() {
+        unsafe { ShowWindow(a.preview_hwnd, SW_HIDE) };
+    }
+}
+
+unsafe fn paint_preview(hwnd: HWND) {
+    let a = app();
+    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    if let Some((_, w, h, buf)) = a.preview.as_ref() {
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = *w;
+        bmi.bmiHeader.biHeight = -*h; // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        StretchDIBits(
+            hdc,
+            0,
+            0,
+            *w,
+            *h,
+            0,
+            0,
+            *w,
+            *h,
+            buf.as_ptr() as *const c_void,
+            &bmi,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+        let border = CreateSolidBrush(theme().sep);
+        let rc = RECT { left: 0, top: 0, right: *w, bottom: *h };
+        FrameRect(hdc, &rc, border);
+        DeleteObject(border as _);
+    }
+    EndPaint(hwnd, &ps);
+}
+
+unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            paint_preview(hwnd);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
 /// Work area of the monitor under a screen point.
 unsafe fn work_area_at(cx: i32, cy: i32) -> RECT {
     let mut mi: MONITORINFO = std::mem::zeroed();
@@ -1585,6 +1682,7 @@ fn relayout(a: &mut App) {
         InvalidateRect(a.hwnd, null(), 1);
     }
     a.hovered = -1;
+    hide_preview(a);
 }
 
 /// Toggle `WS_EX_NOACTIVATE`. Off lets the popup take keyboard focus (for inline
@@ -1614,6 +1712,8 @@ fn hide_popup(a: &mut App) {
         a.kb_focus = false;
         unsafe { set_no_activate(a.hwnd, true) };
     }
+    hide_preview(a);
+    unsafe { KillTimer(a.hwnd, TIMER_PREVIEW) };
     a.caret_on = false;
     a.about = false;
     a.toast = None;
@@ -2689,11 +2789,49 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                           // rebuild and no repaint, which is what caused the end flicker
             }
             a.hovered = -1;
+            hide_preview(&mut a);
+            KillTimer(hwnd, TIMER_PREVIEW);
             rebuild_rows(&mut a);
             InvalidateRect(hwnd, null(), 1);
             0
         }
         WM_TIMER => {
+            if wp == TIMER_PREVIEW {
+                KillTimer(hwnd, TIMER_PREVIEW); // one-shot
+                // Build the scaled preview inside the borrow, place and show the
+                // panel outside it (SetWindowPos can dispatch messages).
+                let show = {
+                    let mut a = app();
+                    preview_target(&a).map(|i| {
+                        let ic = match &a.history[i] {
+                            Clip::Image(ic) => ic.clone(),
+                            _ => unreachable!(),
+                        };
+                        // ~11 rows of height as the long-edge cap tracks DPI
+                        let cap = (a.item_h * 11).max(64) as usize;
+                        let (pw, ph) = fit_cap(ic.w, ic.h, cap);
+                        let buf = scale_bgra(ic.w, ic.h, &ic.rgba, pw, ph);
+                        let row_top = usize::try_from(a.hovered)
+                            .ok()
+                            .and_then(|r| a.rows.get(r))
+                            .map_or(0, |r| r.top);
+                        a.preview = Some((i, pw as i32, ph as i32, buf));
+                        (a.preview_hwnd, a.popup_x, a.popup_y, a.width, row_top, pw as i32, ph as i32)
+                    })
+                };
+                if let Some((phwnd, px, py, pwidth, row_top, w, h)) = show {
+                    let wa = work_area_at(px, py);
+                    let gap = 8;
+                    let mut x = px + pwidth + gap;
+                    if x + w > wa.right {
+                        x = (px - gap - w).max(wa.left); // no room right: flip left
+                    }
+                    let y = (py + row_top).min(wa.bottom - h).max(wa.top);
+                    SetWindowPos(phwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                    InvalidateRect(phwnd, null(), 0);
+                }
+                return 0;
+            }
             if wp == TIMER_CLIP {
                 let mut a = app();
                 if a.edit.is_some() {
@@ -2752,6 +2890,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         InvalidateRect(hwnd, &rc, 1);
                     }
                 }
+                queue_preview(&mut a);
             }
             0
         }
@@ -2760,6 +2899,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             a.hovered = -1;
             a.arm_delete = -1; // disarm any pending pin-delete on leave
             a.tracking_leave = false;
+            hide_preview(&mut a);
+            KillTimer(hwnd, TIMER_PREVIEW);
             InvalidateRect(hwnd, null(), 1);
             0
         }
@@ -2925,6 +3066,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                                 rebuild_rows(&mut a);
                             }
                             a.hovered = sel;
+                            queue_preview(&mut a);
                             InvalidateRect(hwnd, null(), 0);
                             KAct::None
                         }
@@ -2943,6 +3085,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             });
                             if let Some(j) = jump {
                                 a.hovered = j as i32;
+                                queue_preview(&mut a);
                                 InvalidateRect(hwnd, null(), 0);
                             }
                             KAct::None
@@ -3411,6 +3554,8 @@ fn main() {
             vis: 0,
             pin_vis: 0,
             row_budget: TOTAL_VISIBLE,
+            preview: None,
+            preview_hwnd: null_mut(),
             auto_copy,
             drag_start: None,
             theme_idx,
@@ -3459,6 +3604,39 @@ fn main() {
             null(),
         );
         app().hwnd = hwnd;
+
+        // Sibling preview panel for image hover previews, hidden until needed.
+        let prev_class = wide("ClipStackPrev");
+        {
+            let wc = WNDCLASSW {
+                style: CS_DROPSHADOW,
+                lpfnWndProc: Some(preview_wndproc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: hinst,
+                hIcon: null_mut(),
+                hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+                hbrBackground: null_mut(),
+                lpszMenuName: null(),
+                lpszClassName: prev_class.as_ptr(),
+            };
+            RegisterClassW(&wc);
+        }
+        let preview_hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            prev_class.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            10,
+            10,
+            null_mut(),
+            null_mut(),
+            hinst,
+            null(),
+        );
+        app().preview_hwnd = preview_hwnd;
 
         add_tray(hwnd);
         poll_clip(&mut app()); // seed with whatever's on the clipboard now
@@ -3536,6 +3714,14 @@ mod tests {
         assert_eq!(split_rows(50, 99, t), (8, 20));
         // Short history never pads the budget.
         assert_eq!(split_rows(3, 25, t), (3, 20));
+    }
+
+    #[test]
+    fn fit_cap_shrinks_but_never_grows() {
+        assert_eq!(fit_cap(100, 50, 320), (100, 50)); // already fits: untouched
+        assert_eq!(fit_cap(1920, 1080, 320), (320, 180));
+        assert_eq!(fit_cap(500, 2000, 320), (80, 320)); // portrait caps the tall edge
+        assert_eq!(fit_cap(0, 0, 320), (1, 1)); // degenerate input never yields zero
     }
 
     #[test]
