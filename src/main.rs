@@ -80,10 +80,13 @@ const HIST_MAX_VISIBLE: usize = 20; // history rows shown before it scrolls
 const PIN_MAX_VISIBLE: usize = 20; // pin rows shown before the pin block scrolls
 const TOTAL_VISIBLE: usize = 28; // combined row budget (the old 20 + 8)
 
-/// Visible-row split for the popup: `(history_rows, pin_rows)`.
-fn split_rows(hist: usize, pins: usize) -> (usize, usize) {
-    let pvis = pins.min(PIN_MAX_VISIBLE);
-    (hist.min(HIST_MAX_VISIBLE).min(TOTAL_VISIBLE - pvis), pvis)
+/// Visible-row split for the popup within a `total` row budget (TOTAL_VISIBLE,
+/// or less when the monitor can't fit that): `(history_rows, pin_rows)`. Pins
+/// claim what they need up to their cap, but history always keeps room for up
+/// to 8 rows (fewer only when history itself is shorter).
+fn split_rows(hist: usize, pins: usize, total: usize) -> (usize, usize) {
+    let pvis = pins.min(PIN_MAX_VISIBLE).min(total.saturating_sub(hist.min(8)));
+    (hist.min(HIST_MAX_VISIBLE).min(total.saturating_sub(pvis)), pvis)
 }
 const SCROLL_STEP: usize = 3;
 
@@ -258,6 +261,7 @@ struct App {
     pin_scroll: usize,
     vis: usize,     // history rows currently visible (dynamic split, set by rebuild_rows)
     pin_vis: usize, // pin rows currently visible
+    row_budget: usize, // rows the current monitor can show, capped at TOTAL_VISIBLE
     auto_copy: bool,             // opt-in: copy a highlighted selection on drag-release
     drag_start: Option<POINT>,   // left-button-down point, for the drag heuristic
     theme_idx: usize,            // index into THEMES
@@ -1346,7 +1350,7 @@ fn rebuild_rows(a: &mut App) {
     a.rows.clear();
     let n = a.history.len();
     let m = a.pins.len();
-    let (vis, pvis) = split_rows(n, m);
+    let (vis, pvis) = split_rows(n, m, a.row_budget);
     (a.vis, a.pin_vis) = (vis, pvis); // scrolling/nav/thumbs read the live split
     let max_scroll = n.saturating_sub(vis);
     if a.scroll > max_scroll {
@@ -1454,6 +1458,15 @@ fn nav_step(
     (step(cur).map_or(cur as i32, |j| j as i32), 0, 0)
 }
 
+/// Work area of the monitor under a screen point.
+unsafe fn work_area_at(cx: i32, cy: i32) -> RECT {
+    let mut mi: MONITORINFO = std::mem::zeroed();
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    let hmon = MonitorFromPoint(POINT { x: cx, y: cy }, MONITOR_DEFAULTTONEAREST);
+    GetMonitorInfoW(hmon, &mut mi);
+    mi.rcWork
+}
+
 fn show_popup(a: &mut App, cx: i32, cy: i32) {
     if a.history.is_empty() && a.pins.is_empty() {
         return;
@@ -1464,6 +1477,13 @@ fn show_popup(a: &mut App, cx: i32, cy: i32) {
     a.sep_h = (12.0 * scale) as i32;
     a.pad = (6.0 * scale) as i32;
     a.width = (306.0 * scale) as i32;
+
+    // Clamp the row budget to what this monitor can actually show, so a full
+    // popup on a small or heavily scaled screen shrinks its visible windows
+    // (the sections already scroll) instead of running off the work area.
+    let wa = unsafe { work_area_at(cx, cy) };
+    let usable = (wa.bottom - wa.top - a.pad * 2 - a.sep_h).max(a.item_h);
+    a.row_budget = ((usable / a.item_h).max(1) as usize).min(TOTAL_VISIBLE);
 
     if !a.font.is_null() {
         unsafe { DeleteObject(a.font as _) };
@@ -1504,11 +1524,7 @@ unsafe fn dpi_for_point(cx: i32, cy: i32) -> u32 {
 unsafe fn place_and_show(a: &mut App, cx: i32, cy: i32, height: i32) {
     // Use the work area of the monitor *under the cursor*, not the primary one
     // (SPI_GETWORKAREA is primary-only), so the popup lands on the right screen.
-    let mut mi: MONITORINFO = std::mem::zeroed();
-    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-    let hmon = MonitorFromPoint(POINT { x: cx, y: cy }, MONITOR_DEFAULTTONEAREST);
-    GetMonitorInfoW(hmon, &mut mi);
-    let wa = mi.rcWork;
+    let wa = work_area_at(cx, cy);
     let xx = cx.min(wa.right - a.width).max(wa.left);
     let yy = cy.min(wa.bottom - height).max(wa.top);
     a.popup_x = xx;
@@ -3394,6 +3410,7 @@ fn main() {
             pin_scroll: 0,
             vis: 0,
             pin_vis: 0,
+            row_budget: TOTAL_VISIBLE,
             auto_copy,
             drag_start: None,
             theme_idx,
@@ -3507,17 +3524,30 @@ mod tests {
 
     #[test]
     fn split_rows_gives_pins_the_rows_they_earn() {
+        let t = TOTAL_VISIBLE;
         // 8 or fewer pins: identical to the old fixed 20/8 layout.
-        assert_eq!(split_rows(50, 0), (20, 0));
-        assert_eq!(split_rows(50, 8), (20, 8));
-        assert_eq!(split_rows(5, 3), (5, 3));
+        assert_eq!(split_rows(50, 0, t), (20, 0));
+        assert_eq!(split_rows(50, 8, t), (20, 8));
+        assert_eq!(split_rows(5, 3, t), (5, 3));
         // More pins: pins grow, history shrinks toward the 28-row budget.
-        assert_eq!(split_rows(50, 12), (16, 12));
-        assert_eq!(split_rows(50, 20), (8, 20));
+        assert_eq!(split_rows(50, 12, t), (16, 12));
+        assert_eq!(split_rows(50, 20, t), (8, 20));
         // Pins past their cap scroll instead of growing further.
-        assert_eq!(split_rows(50, 99), (8, 20));
+        assert_eq!(split_rows(50, 99, t), (8, 20));
         // Short history never pads the budget.
-        assert_eq!(split_rows(3, 25), (3, 20));
+        assert_eq!(split_rows(3, 25, t), (3, 20));
+    }
+
+    #[test]
+    fn split_rows_respects_a_clamped_budget() {
+        // Small monitor: both sections share what fits, history keeps its 8.
+        assert_eq!(split_rows(50, 30, 16), (8, 8));
+        // Short history cedes its reserve to pins.
+        assert_eq!(split_rows(2, 30, 16), (2, 14));
+        // No pins: history takes the whole clamped budget.
+        assert_eq!(split_rows(50, 0, 10), (10, 0));
+        // Degenerate budget never underflows.
+        assert_eq!(split_rows(50, 30, 1), (1, 0));
     }
 
     #[test]
