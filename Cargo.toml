@@ -7,9 +7,7 @@ license = "MIT"
 repository = "https://github.com/HologramHacks/clipstack"
 authors = ["Brian Jones"]
 
-[dependencies]
-
-[dependencies.windows-sys]
+[target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"
 features = [
     "Win32_Foundation",
@@ -26,6 +24,12 @@ features = [
     "Win32_Security_Cryptography",
     "Win32_UI_HiDpi",
 ]
+
+# Experimental macOS port (src/mac.rs): compile-verified on CI only so far.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
 
 [profile.release]
 opt-level = "z"

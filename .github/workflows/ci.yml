@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # feat/macos-experimental is listed so the port branch gets CI without a
+    # PR; drop it here when the branch merges or dies.
+    branches: [main, feat/macos-experimental]
   pull_request:
 
 permissions:
@@ -36,6 +38,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable-x86_64-pc-windows-gnu
+      - name: Build (release)
+        run: cargo build --release --verbose
+      - name: Tests
+        run: cargo test --verbose
+
+  # Experimental macOS port (src/mac.rs): compile check only, there is no
+  # Mac hardware in the loop yet.
+  build-macos:
+    name: Build (macOS, experimental)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
       - name: Build (release)
         run: cargo build --release --verbose
       - name: Tests
