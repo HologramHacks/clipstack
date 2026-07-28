@@ -1,6 +1,6 @@
 // ClipStack, a tiny clipboard-history popup for Windows.
 //
-// * Keeps the last MAX_HISTORY text/image clips; the popup shows VISIBLE at a
+// * Keeps the last MAX_HISTORY text/image clips; the popup shows a dynamic split at a
 //   time and the mouse wheel scrolls the rest.
 // * Plain middle-click pops a small, no-activate list near the cursor.
 // * Left-click an item: copies it AND pastes into whatever field had focus.
@@ -71,9 +71,20 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const MAX_HISTORY: usize = 50;
-const MAX_PINS: usize = 99; // generous cap; the pin block scrolls past PIN_VISIBLE
-const VISIBLE: usize = 20; // history rows shown before it scrolls
-const PIN_VISIBLE: usize = 8; // pin rows shown before the pin block scrolls
+const MAX_PINS: usize = 99; // generous cap; the pin block scrolls past its visible window
+// The history/pins split is dynamic: pins are the reused clips, so they claim
+// the rows they actually need (up to PIN_MAX_VISIBLE) and history takes what
+// is left of TOTAL_VISIBLE. With 8 or fewer pins this matches the old fixed
+// 20/8 layout exactly, and the popup never grows taller than it could before.
+const HIST_MAX_VISIBLE: usize = 20; // history rows shown before it scrolls
+const PIN_MAX_VISIBLE: usize = 20; // pin rows shown before the pin block scrolls
+const TOTAL_VISIBLE: usize = 28; // combined row budget (the old 20 + 8)
+
+/// Visible-row split for the popup: `(history_rows, pin_rows)`.
+fn split_rows(hist: usize, pins: usize) -> (usize, usize) {
+    let pvis = pins.min(PIN_MAX_VISIBLE);
+    (hist.min(HIST_MAX_VISIBLE).min(TOTAL_VISIBLE - pvis), pvis)
+}
 const SCROLL_STEP: usize = 3;
 
 // Custom window messages.
@@ -245,6 +256,8 @@ struct App {
     rows: Vec<VRow>,
     scroll: usize,
     pin_scroll: usize,
+    vis: usize,     // history rows currently visible (dynamic split, set by rebuild_rows)
+    pin_vis: usize, // pin rows currently visible
     auto_copy: bool,             // opt-in: copy a highlighted selection on drag-release
     drag_start: Option<POINT>,   // left-button-down point, for the drag heuristic
     theme_idx: usize,            // index into THEMES
@@ -1332,7 +1345,9 @@ fn set_startup(on: bool) {
 fn rebuild_rows(a: &mut App) {
     a.rows.clear();
     let n = a.history.len();
-    let vis = n.min(VISIBLE);
+    let m = a.pins.len();
+    let (vis, pvis) = split_rows(n, m);
+    (a.vis, a.pin_vis) = (vis, pvis); // scrolling/nav/thumbs read the live split
     let max_scroll = n.saturating_sub(vis);
     if a.scroll > max_scroll {
         a.scroll = max_scroll;
@@ -1342,11 +1357,9 @@ fn rebuild_rows(a: &mut App) {
         a.rows.push(VRow { kind: RowKind::Hist(i), top: y, bottom: y + a.item_h });
         y += a.item_h;
     }
-    let m = a.pins.len();
     if m > 0 {
         a.rows.push(VRow { kind: RowKind::Sep, top: y, bottom: y + a.sep_h });
         y += a.sep_h;
-        let pvis = m.min(PIN_VISIBLE);
         a.pin_scroll = a.pin_scroll.min(m - pvis); // pvis <= m, so no underflow
         for j in a.pin_scroll..a.pin_scroll + pvis {
             a.rows.push(VRow { kind: RowKind::Pin(j), top: y, bottom: y + a.item_h });
@@ -2127,18 +2140,18 @@ unsafe fn paint(hwnd: HWND) {
         }
     }
 
-    if a.history.len() > VISIBLE {
+    if a.history.len() > a.vis {
         let t = a.rows.iter().find(|r| matches!(r.kind, RowKind::Hist(_))).map(|r| r.top);
         let b = a.rows.iter().rev().find(|r| matches!(r.kind, RowKind::Hist(_))).map(|r| r.bottom);
         if let (Some(t), Some(b)) = (t, b) {
-            draw_scroll_thumb(hdc, a.width, t, b, a.history.len(), VISIBLE, a.scroll);
+            draw_scroll_thumb(hdc, a.width, t, b, a.history.len(), a.vis, a.scroll);
         }
     }
-    if a.pins.len() > PIN_VISIBLE {
+    if a.pins.len() > a.pin_vis {
         let t = a.rows.iter().find(|r| matches!(r.kind, RowKind::Pin(_))).map(|r| r.top);
         let b = a.rows.iter().rev().find(|r| matches!(r.kind, RowKind::Pin(_))).map(|r| r.bottom);
         if let (Some(t), Some(b)) = (t, b) {
-            draw_scroll_thumb(hdc, a.width, t, b, a.pins.len(), PIN_VISIBLE, a.pin_scroll);
+            draw_scroll_thumb(hdc, a.width, t, b, a.pins.len(), a.pin_vis, a.pin_scroll);
         }
     }
 
@@ -2645,13 +2658,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             match (over_pins, wp) {
                 (true, 1) => a.pin_scroll = a.pin_scroll.saturating_sub(SCROLL_STEP),
                 (true, 2) => {
-                    let m = a.pins.len();
-                    let max = m.saturating_sub(m.min(PIN_VISIBLE));
+                    let max = a.pins.len().saturating_sub(a.pin_vis);
                     a.pin_scroll = (a.pin_scroll + SCROLL_STEP).min(max);
                 }
                 (false, 1) => a.scroll = a.scroll.saturating_sub(SCROLL_STEP),
                 (false, 2) => {
-                    let max = a.history.len().saturating_sub(a.history.len().min(VISIBLE));
+                    let max = a.history.len().saturating_sub(a.vis);
                     a.scroll = (a.scroll + SCROLL_STEP).min(max);
                 }
                 _ => {}
@@ -2884,8 +2896,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             let down = wp as u16 == 0x28;
                             let (can_h, can_p) = if down {
                                 (
-                                    a.scroll + VISIBLE < a.history.len(),
-                                    a.pin_scroll + PIN_VISIBLE < a.pins.len(),
+                                    a.scroll + a.vis < a.history.len(),
+                                    a.pin_scroll + a.pin_vis < a.pins.len(),
                                 )
                             } else {
                                 (a.scroll > 0, a.pin_scroll > 0)
@@ -3380,6 +3392,8 @@ fn main() {
             rows: Vec::new(),
             scroll: 0,
             pin_scroll: 0,
+            vis: 0,
+            pin_vis: 0,
             auto_copy,
             drag_start: None,
             theme_idx,
@@ -3489,6 +3503,21 @@ mod tests {
     fn escape_emits_no_raw_control_chars() {
         let e = escape("a\nb\tc\rd");
         assert!(!e.contains('\n') && !e.contains('\t') && !e.contains('\r'));
+    }
+
+    #[test]
+    fn split_rows_gives_pins_the_rows_they_earn() {
+        // 8 or fewer pins: identical to the old fixed 20/8 layout.
+        assert_eq!(split_rows(50, 0), (20, 0));
+        assert_eq!(split_rows(50, 8), (20, 8));
+        assert_eq!(split_rows(5, 3), (5, 3));
+        // More pins: pins grow, history shrinks toward the 28-row budget.
+        assert_eq!(split_rows(50, 12), (16, 12));
+        assert_eq!(split_rows(50, 20), (8, 20));
+        // Pins past their cap scroll instead of growing further.
+        assert_eq!(split_rows(50, 99), (8, 20));
+        // Short history never pads the budget.
+        assert_eq!(split_rows(3, 25), (3, 20));
     }
 
     #[test]
