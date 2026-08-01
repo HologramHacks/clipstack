@@ -589,32 +589,45 @@ fn make_preview(s: &str) -> Vec<u16> {
 
 // ---- Clipboard history ----------------------------------------------------
 
-/// Nearest-neighbor RGBA -> top-down 32bpp BGRA at the given size. Shared by
-/// the row thumbnails and the hover preview.
-// ponytail: nearest sampling; box-filter it if previews look crunchy
+/// Box-filter RGBA -> top-down 32bpp BGRA at the given size: every source
+/// pixel in a destination pixel's footprint is averaged, which keeps
+/// downscaled screenshot text readable where nearest sampling shredded it.
+/// Shared by the row thumbnails and the hover preview.
 fn scale_bgra(w: usize, h: usize, rgba: &[u8], tw: usize, th: usize) -> Vec<u8> {
     let mut out = vec![0u8; tw * th * 4];
     for y in 0..th {
-        let sy = (y * h / th).min(h - 1);
+        let sy0 = y * h / th;
+        let sy1 = ((y + 1) * h).div_ceil(th).min(h).max(sy0 + 1);
         for x in 0..tw {
-            let sx = (x * w / tw).min(w - 1);
-            let si = (sy * w + sx) * 4;
+            let sx0 = x * w / tw;
+            let sx1 = ((x + 1) * w).div_ceil(tw).min(w).max(sx0 + 1);
+            let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+            for sy in sy0..sy1 {
+                for sx in sx0..sx1 {
+                    let si = (sy * w + sx) * 4;
+                    r += rgba[si] as u32;
+                    g += rgba[si + 1] as u32;
+                    b += rgba[si + 2] as u32;
+                }
+            }
+            let n = ((sy1 - sy0) * (sx1 - sx0)) as u32;
             let di = (y * tw + x) * 4;
-            out[di] = rgba[si + 2]; // B
-            out[di + 1] = rgba[si + 1]; // G
-            out[di + 2] = rgba[si]; // R
+            out[di] = (b / n) as u8;
+            out[di + 1] = (g / n) as u8;
+            out[di + 2] = (r / n) as u8;
             out[di + 3] = 255;
         }
     }
     out
 }
 
-/// Shrink (never grow) `w x h` so the long edge fits `cap`.
-fn fit_cap(w: usize, h: usize, cap: usize) -> (usize, usize) {
-    if w <= cap && h <= cap {
+/// Shrink (never grow) `w x h` to fit inside `max_w x max_h`.
+fn fit_box(w: usize, h: usize, max_w: usize, max_h: usize) -> (usize, usize) {
+    let (max_w, max_h) = (max_w.max(1), max_h.max(1));
+    if w <= max_w && h <= max_h {
         return (w.max(1), h.max(1));
     }
-    let s = cap as f32 / w.max(h) as f32;
+    let s = (max_w as f32 / w.max(1) as f32).min(max_h as f32 / h.max(1) as f32);
     (((w as f32 * s) as usize).max(1), ((h as f32 * s) as usize).max(1))
 }
 
@@ -2807,25 +2820,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             Clip::Image(ic) => ic.clone(),
                             _ => unreachable!(),
                         };
-                        // ~11 rows of height as the long-edge cap tracks DPI
-                        let cap = (a.item_h * 11).max(64) as usize;
-                        let (pw, ph) = fit_cap(ic.w, ic.h, cap);
+                        // Size to the real estate beside the popup (whichever
+                        // side is wider), full work-area height minus margins.
+                        // Small images render 1:1, never upscaled.
+                        let wa = work_area_at(a.popup_x, a.popup_y);
+                        let gap = 8;
+                        let margin = a.pad * 2;
+                        let right_space =
+                            (wa.right - (a.popup_x + a.width + gap) - margin).max(0) as usize;
+                        let left_space = (a.popup_x - gap - wa.left - margin).max(0) as usize;
+                        let cap_w = right_space.max(left_space).max(64);
+                        let cap_h = (wa.bottom - wa.top - margin * 2).max(64) as usize;
+                        let (pw, ph) = fit_box(ic.w, ic.h, cap_w, cap_h);
                         let buf = scale_bgra(ic.w, ic.h, &ic.rgba, pw, ph);
                         let row_top = usize::try_from(a.hovered)
                             .ok()
                             .and_then(|r| a.rows.get(r))
                             .map_or(0, |r| r.top);
+                        let fits_right = pw <= right_space;
                         a.preview = Some((i, pw as i32, ph as i32, buf));
-                        (a.preview_hwnd, a.popup_x, a.popup_y, a.width, row_top, pw as i32, ph as i32)
+                        (a.preview_hwnd, a.popup_x, a.popup_y, a.width, row_top, pw as i32, ph as i32, fits_right)
                     })
                 };
-                if let Some((phwnd, px, py, pwidth, row_top, w, h)) = show {
+                if let Some((phwnd, px, py, pwidth, row_top, w, h, fits_right)) = show {
                     let wa = work_area_at(px, py);
                     let gap = 8;
-                    let mut x = px + pwidth + gap;
-                    if x + w > wa.right {
-                        x = (px - gap - w).max(wa.left); // no room right: flip left
-                    }
+                    let x = if fits_right {
+                        px + pwidth + gap
+                    } else {
+                        (px - gap - w).max(wa.left)
+                    };
                     let y = (py + row_top).min(wa.bottom - h).max(wa.top);
                     SetWindowPos(phwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
                     InvalidateRect(phwnd, null(), 0);
@@ -3717,11 +3741,23 @@ mod tests {
     }
 
     #[test]
-    fn fit_cap_shrinks_but_never_grows() {
-        assert_eq!(fit_cap(100, 50, 320), (100, 50)); // already fits: untouched
-        assert_eq!(fit_cap(1920, 1080, 320), (320, 180));
-        assert_eq!(fit_cap(500, 2000, 320), (80, 320)); // portrait caps the tall edge
-        assert_eq!(fit_cap(0, 0, 320), (1, 1)); // degenerate input never yields zero
+    fn fit_box_shrinks_but_never_grows() {
+        assert_eq!(fit_box(100, 50, 800, 600), (100, 50)); // already fits: untouched
+        assert_eq!(fit_box(1920, 1080, 800, 900), (800, 450)); // width-bound
+        assert_eq!(fit_box(1000, 2000, 800, 900), (450, 900)); // height-bound
+        assert_eq!(fit_box(0, 0, 800, 600), (1, 1)); // degenerate input never yields zero
+    }
+
+    #[test]
+    fn scale_bgra_box_averages_when_shrinking() {
+        // Black + white side by side collapse to one mid-gray BGRA pixel.
+        let rgba = [0, 0, 0, 255, 255, 255, 255, 255];
+        let out = scale_bgra(2, 1, &rgba, 1, 1);
+        assert_eq!(&out[..4], &[127, 127, 127, 255]);
+        // Downscale 4x4 solid red: stays solid red (B=0, G=0, R=255).
+        let red: Vec<u8> = (0..16).flat_map(|_| [255, 0, 0, 255]).collect();
+        let out = scale_bgra(4, 4, &red, 2, 2);
+        assert_eq!(&out[..4], &[0, 0, 255, 255]);
     }
 
     #[test]
