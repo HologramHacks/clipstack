@@ -268,7 +268,7 @@ struct App {
     auto_copy: bool,             // opt-in: copy a highlighted selection on drag-release
     drag_start: Option<POINT>,   // left-button-down point, for the drag heuristic
     theme_idx: usize,            // index into THEMES
-    arm_delete: i32,             // pin row index whose delete is armed (one-click confirm), or -1
+    arm_delete: Option<usize>,   // PIN index (never a row index) whose delete is armed
     target: HWND,
     paused: bool,
     visible: bool,
@@ -752,14 +752,17 @@ fn poll_clip(a: &mut App) {
     }
 }
 
-fn set_clipboard(a: &mut App, clip: &Clip) {
+/// Returns false if the clip could not be placed on the clipboard, in which
+/// case the caller must not paste: the clipboard still holds something else.
+fn set_clipboard(a: &mut App, clip: &Clip) -> bool {
     unsafe {
-        match clip {
+        let ok = match clip {
             Clip::Text(s) => set_clipboard_text(a.hwnd, s, false),
             Clip::Image(ic) => clip_set_image(a.hwnd, ic.w, ic.h, &ic.rgba),
-        }
+        };
         // Don't re-ingest our own write on the next poll.
         a.last_seq = GetClipboardSequenceNumber();
+        ok
     }
 }
 
@@ -871,14 +874,20 @@ fn dib_to_rgba(d: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
 /// pinned secret, also tag it out of Windows clipboard history (Win+V) and
 /// cloud sync, the way password managers do (these formats have no library, so
 /// it's done by hand here either way).
-unsafe fn set_clipboard_text(hwnd: HWND, s: &str, exclude: bool) {
-    if OpenClipboard(hwnd) == 0 {
-        return;
+unsafe fn set_clipboard_text(hwnd: HWND, s: &str, exclude: bool) -> bool {
+    if !open_clipboard_retry(hwnd) {
+        return false;
     }
     EmptyClipboard();
-    let text: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
-    let bytes = std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len() * 2);
-    set_clip_data(CF_UNICODETEXT, global_from(bytes));
+    let mut text: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    let h = {
+        let bytes = std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len() * 2);
+        global_from(bytes) // copies into the HGLOBAL
+    };
+    let ok = set_clip_data(CF_UNICODETEXT, h);
+    // This path pastes pinned secrets, so wipe our UTF-16 copy rather than
+    // letting it reach the allocator with the plaintext intact.
+    text.iter_mut().for_each(|u| std::ptr::write_volatile(u, 0));
     if exclude {
         // Exclusion tags (each a DWORD 0): keep it out of Win+V and the cloud.
         let zero = 0u32.to_ne_bytes();
@@ -894,12 +903,29 @@ unsafe fn set_clipboard_text(hwnd: HWND, s: &str, exclude: bool) {
         }
     }
     CloseClipboard();
+    ok
+}
+
+/// OpenClipboard, retried briefly. Another app holding the clipboard is common
+/// and transient (we poll it ourselves twice a second), and the alternative to
+/// waiting is pasting whatever was on the clipboard before, which for a paste
+/// action is worse than a short stall.
+unsafe fn open_clipboard_retry(hwnd: HWND) -> bool {
+    for attempt in 0..5 {
+        if OpenClipboard(hwnd) != 0 {
+            return true;
+        }
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    false
 }
 
 /// Put an RGBA image on the clipboard as a top-down 32-bit CF_DIB.
-unsafe fn clip_set_image(hwnd: HWND, w: usize, h: usize, rgba: &[u8]) {
+unsafe fn clip_set_image(hwnd: HWND, w: usize, h: usize, rgba: &[u8]) -> bool {
     if w == 0 || h == 0 || rgba.len() < w * h * 4 {
-        return;
+        return false;
     }
     let mut dib: Vec<u8> = Vec::with_capacity(40 + w * h * 4);
     dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
@@ -913,12 +939,13 @@ unsafe fn clip_set_image(hwnd: HWND, w: usize, h: usize, rgba: &[u8]) {
     for px in rgba.chunks_exact(4) {
         dib.extend_from_slice(&[px[2], px[1], px[0], px[3]]); // RGBA -> BGRA
     }
-    if OpenClipboard(hwnd) == 0 {
-        return;
+    if !open_clipboard_retry(hwnd) {
+        return false;
     }
     EmptyClipboard();
-    set_clip_data(CF_DIB, global_from(&dib));
+    let ok = set_clip_data(CF_DIB, global_from(&dib));
     CloseClipboard();
+    ok
 }
 
 const CF_UNICODETEXT: u32 = 13;
@@ -940,13 +967,15 @@ unsafe fn global_from(bytes: &[u8]) -> *mut c_void {
 
 /// `SetClipboardData`, freeing the handle if the system didn't take ownership
 /// (a failed call leaves us owning it, free it so we don't leak).
-unsafe fn set_clip_data(fmt: u32, h: *mut c_void) {
+unsafe fn set_clip_data(fmt: u32, h: *mut c_void) -> bool {
     if h.is_null() {
-        return;
+        return false;
     }
     if SetClipboardData(fmt, h).is_null() {
         GlobalFree(h);
+        return false;
     }
+    true
 }
 
 // ---- Pin persistence (DPAPI) ----------------------------------------------
@@ -1128,14 +1157,23 @@ fn migrate_from(src: &std::path::Path, base: &std::path::Path) {
 
 /// DPAPI-encrypt `s` and write it to `path`. Writes nothing if encryption
 /// fails, there is never a plaintext fallback.
-fn write_encrypted(path: std::path::PathBuf, s: &str) {
+///
+/// Write-then-rename, never a bare overwrite: a write interrupted by a crash or
+/// power loss would truncate the real file, which then fails to decrypt, loads
+/// as empty, and the next save silently overwrites the only copy of every pin
+/// with nothing. `fs::rename` maps to MoveFileEx with MOVEFILE_REPLACE_EXISTING
+/// on Windows, so the swap is atomic.
+fn write_encrypted(path: &std::path::Path, s: &str) {
     if let Some(enc) = dpapi_protect(s.as_bytes()) {
-        let _ = std::fs::write(path, enc);
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, enc).is_ok() && std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp); // rename failed: don't leave litter
+        }
     }
 }
 
 /// Read and DPAPI-decrypt `path` back into a string, if present and valid.
-fn read_encrypted(path: std::path::PathBuf) -> Option<String> {
+fn read_encrypted(path: &std::path::Path) -> Option<String> {
     let enc = std::fs::read(path).ok()?;
     let bytes = dpapi_unprotect(&enc)?;
     String::from_utf8(bytes).ok()
@@ -1151,22 +1189,36 @@ fn save_pins(a: &App) {
         s.push('\n');
         scrub_string(&mut secret);
     }
-    write_encrypted(appdata_file("pins.dat"), &s);
+    write_encrypted(&appdata_file("pins.dat"), &s);
     scrub_string(&mut s); // s briefly held the plaintext secrets
 }
 
 fn load_pins() -> Vec<Pin> {
+    load_pins_from(&appdata_file("pins.dat"))
+}
+
+/// The testable core of `load_pins`. An unreadable-but-present file is set
+/// aside as `pins.bad` rather than left in place: starting with no pins is
+/// recoverable, but leaving the file would let the next save overwrite the
+/// only copy of every secret with an empty set.
+fn load_pins_from(path: &std::path::Path) -> Vec<Pin> {
     let mut pins = Vec::new();
-    if let Some(mut text) = read_encrypted(appdata_file("pins.dat")) {
-        for line in text.lines() {
-            if let Some((l, sec)) = line.split_once('\t') {
-                let mut secret = unescape(sec);
-                let (secret_enc, len) = protect_secret(&secret);
-                scrub_string(&mut secret);
-                pins.push(Pin { label: unescape(l), secret_enc, len });
+    match read_encrypted(path) {
+        Some(mut text) => {
+            for line in text.lines() {
+                if let Some((l, sec)) = line.split_once('\t') {
+                    let mut secret = unescape(sec);
+                    let (secret_enc, len) = protect_secret(&secret);
+                    scrub_string(&mut secret);
+                    pins.push(Pin { label: unescape(l), secret_enc, len });
+                }
             }
+            scrub_string(&mut text); // the decrypted file held plaintext secrets
         }
-        scrub_string(&mut text); // the decrypted file held plaintext secrets
+        None if path.exists() => {
+            let _ = std::fs::rename(path, path.with_extension("bad"));
+        }
+        None => {}
     }
     pins
 }
@@ -1268,13 +1320,13 @@ fn save_history(a: &App) {
             s.push('\n');
         }
     }
-    write_encrypted(appdata_file("history.dat"), &s);
+    write_encrypted(&appdata_file("history.dat"), &s);
 }
 
 /// Load persisted text clips, if any.
 fn load_history() -> Vec<Clip> {
     let mut history = Vec::new();
-    if let Some(text) = read_encrypted(appdata_file("history.dat")) {
+    if let Some(text) = read_encrypted(&appdata_file("history.dat")) {
         for line in text.lines() {
             if !line.is_empty() {
                 history.push(Clip::Text(unescape(line)));
@@ -1385,6 +1437,9 @@ fn rebuild_rows(a: &mut App) {
     let m = a.pins.len();
     let (vis, pvis) = split_rows(n, m, a.row_budget);
     (a.vis, a.pin_vis) = (vis, pvis); // scrolling/nav/thumbs read the live split
+    if a.arm_delete.is_some_and(|j| j >= m) {
+        a.arm_delete = None; // the armed pin is gone
+    }
     let max_scroll = n.saturating_sub(vis);
     if a.scroll > max_scroll {
         a.scroll = max_scroll;
@@ -1407,6 +1462,15 @@ fn rebuild_rows(a: &mut App) {
 
 fn rows_height(a: &App) -> i32 {
     a.rows.last().map(|r| r.bottom).unwrap_or(a.pad) + a.pad
+}
+
+/// Pin index of `row`, if that row is a pin. Used to keep the armed delete
+/// pointed at a pin rather than at a screen position.
+fn pin_at_row(a: &App, row: i32) -> Option<usize> {
+    match usize::try_from(row).ok().and_then(|r| a.rows.get(r))?.kind {
+        RowKind::Pin(j) => Some(j),
+        _ => None,
+    }
 }
 
 fn row_at(a: &App, y: i32) -> Option<usize> {
@@ -1733,7 +1797,7 @@ fn hide_popup(a: &mut App) {
     unsafe { ShowWindow(a.hwnd, SW_HIDE) };
     a.visible = false;
     a.hovered = -1;
-    a.arm_delete = -1;
+    a.arm_delete = None;
     unsafe { reconcile_input(a) }; // drop the hook again if a keyboard trigger
 }
 
@@ -2254,7 +2318,7 @@ unsafe fn paint(hwnd: HWND) {
                 let lx = text_left + text_width(hdc, &bullets) + a.pad * 3;
                 SetTextColor(hdc, if hovered { theme().strong } else { theme().text });
                 draw_text_row(hdc, lx, r.top, pin_col, r.bottom, &wide_no_nul(&a.pins[j].label));
-                if hovered && idx as i32 == a.arm_delete {
+                if hovered && a.arm_delete == Some(j) {
                     // Armed: a solid red confirm button (inverted ✕), so a stray
                     // first click clearly warns instead of deleting.
                     fill_color(hdc, text_right, r.top + 1, a.width, r.bottom, theme().delete);
@@ -2326,11 +2390,25 @@ fn delete_row(a: &mut App, idx: usize) {
     }
 }
 
+/// Say the clipboard stayed busy instead of pasting whatever was on it before.
+fn toast_clipboard_busy(a: &mut App) {
+    a.toast = Some("Clipboard busy, nothing pasted. Try again.".to_string());
+    a.toast_ticks = 5; // ~2.5s on the 500ms tick
+    unsafe { InvalidateRect(a.hwnd, null(), 0) };
+}
+
+/// Put the row's content on the clipboard and return the window to paste into,
+/// or null to paste nothing. A failed clipboard write returns null and leaves
+/// the popup open with a toast: pasting anyway would paste the previous clip,
+/// and for a pin that means the wrong secret lands in the target app.
 fn commit_row(a: &mut App, idx: usize) -> HWND {
     match a.rows[idx].kind {
         RowKind::Hist(i) => {
             let clip = a.history[i].clone();
-            set_clipboard(a, &clip);
+            if !set_clipboard(a, &clip) {
+                toast_clipboard_busy(a);
+                return null_mut();
+            }
             let c = a.history.remove(i);
             a.history.insert(0, c);
             a.history_dirty = true;
@@ -2339,11 +2417,16 @@ fn commit_row(a: &mut App, idx: usize) -> HWND {
         }
         RowKind::Pin(j) => {
             let mut s = unprotect_secret(&a.pins[j].secret_enc, a.pins[j].len);
-            unsafe {
-                set_clipboard_text(a.hwnd, &s, true); // excluded from Win+V history + cloud
+            let ok = unsafe {
+                let ok = set_clipboard_text(a.hwnd, &s, true); // excluded from Win+V + cloud
                 a.last_seq = GetClipboardSequenceNumber(); // don't re-ingest our own write
-            }
+                ok
+            };
             scrub_string(&mut s); // wipe our transient plaintext (the live clipboard copy is inherent)
+            if !ok {
+                toast_clipboard_busy(a);
+                return null_mut();
+            }
             hide_popup(a);
             a.target
         }
@@ -2903,8 +2986,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if row != a.hovered {
                 let old = a.hovered;
                 a.hovered = row;
-                if a.arm_delete >= 0 && a.arm_delete != row {
-                    a.arm_delete = -1; // moved off the armed pin: disarm it
+                if a.arm_delete.is_some() && a.arm_delete != pin_at_row(&a, row) {
+                    a.arm_delete = None; // moved off the armed pin: disarm it
                 }
                 // Repaint only the two affected rows so the rest of the list
                 // doesn't flash on hover.
@@ -2921,7 +3004,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSELEAVE => {
             let mut a = app();
             a.hovered = -1;
-            a.arm_delete = -1; // disarm any pending pin-delete on leave
+            a.arm_delete = None; // disarm any pending pin-delete on leave
             a.tracking_leave = false;
             hide_preview(&mut a);
             KillTimer(hwnd, TIMER_PREVIEW);
@@ -2975,23 +3058,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let act = {
                 let mut a = app();
                 let was_armed = a.arm_delete;
-                a.arm_delete = -1; // any click disarms a pending pin-delete by default
+                a.arm_delete = None; // any click disarms a pending pin-delete by default
                 match row_at(&a, y) {
                     Some(idx) if x >= a.width - a.item_h => {
                         // Clicked the ✕ on the right edge. Pins require a confirming
                         // second click: the first click arms it (history deletes in one).
-                        if matches!(a.rows[idx].kind, RowKind::Pin(_)) && was_armed != idx as i32 {
-                            a.arm_delete = idx as i32;
-                            InvalidateRect(a.hwnd, null(), 1);
-                            Act::None
-                        } else {
-                            delete_row(&mut a, idx);
-                            if a.history.is_empty() && a.pins.is_empty() {
-                                hide_popup(&mut a);
-                            } else {
-                                relayout(&mut a);
+                        // The arm tracks the PIN index, not the row: rows are rebuilt by
+                        // scrolling, so a row-keyed arm would re-point at whatever pin
+                        // scrolled into that slot and delete it on the confirming click.
+                        match a.rows[idx].kind {
+                            RowKind::Pin(j) if was_armed != Some(j) => {
+                                a.arm_delete = Some(j);
+                                InvalidateRect(a.hwnd, null(), 1);
+                                Act::None
                             }
-                            Act::None
+                            _ => {
+                                delete_row(&mut a, idx);
+                                if a.history.is_empty() && a.pins.is_empty() {
+                                    hide_popup(&mut a);
+                                } else {
+                                    relayout(&mut a);
+                                }
+                                Act::None
+                            }
                         }
                     }
                     Some(idx) if x >= a.width - a.item_h * 2 => {
@@ -3583,7 +3672,7 @@ fn main() {
             auto_copy,
             drag_start: None,
             theme_idx,
-            arm_delete: -1,
+            arm_delete: None,
             target: null_mut(),
             paused: false,
             visible: false,
@@ -3701,6 +3790,42 @@ mod tests {
         assert_eq!(std::fs::read(base.join("settings.txt")).unwrap(), b"current");
         assert!(!src.exists(), "legacy folder should be gone after a verified copy");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A DPAPI round-trip through the real files, plus the guarantee that a
+    /// write leaves no .tmp behind.
+    #[test]
+    fn encrypted_write_roundtrips_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("clipstack-enc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pins.dat");
+        write_encrypted(&path, "label\tsecret\n");
+        assert_eq!(read_encrypted(&path).as_deref(), Some("label\tsecret\n"));
+        assert!(!path.with_extension("tmp").exists(), "temp file was left behind");
+        // Overwriting an existing file must also work (rename replaces).
+        write_encrypted(&path, "other\tvalue\n");
+        assert_eq!(read_encrypted(&path).as_deref(), Some("other\tvalue\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable pins file must be preserved, not left in place for the
+    /// next save to overwrite with an empty set.
+    #[test]
+    fn unreadable_pins_file_is_set_aside_not_lost() {
+        let dir = std::env::temp_dir().join(format!("clipstack-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pins.dat");
+        std::fs::write(&path, b"not a DPAPI blob").unwrap();
+        let pins = load_pins_from(&path);
+        assert!(pins.is_empty());
+        assert!(!path.exists(), "the unreadable file should have been moved");
+        let bad = path.with_extension("bad");
+        assert_eq!(std::fs::read(&bad).unwrap(), b"not a DPAPI blob", "data must survive");
+        // A missing file is normal (first run) and must not create anything.
+        let fresh = dir.join("none.dat");
+        assert!(load_pins_from(&fresh).is_empty());
+        assert!(!fresh.with_extension("bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
