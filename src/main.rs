@@ -18,11 +18,8 @@
 #![allow(non_snake_case)]
 
 use std::cell::{RefCell, RefMut};
-use std::collections::hash_map::DefaultHasher;
 use std::ffi::c_void;
-use std::hash::{Hash, Hasher};
 use std::ptr::{null, null_mut};
-use std::rc::Rc;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
@@ -70,25 +67,19 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-const MAX_HISTORY: usize = 50;
-const MAX_PINS: usize = 99; // generous cap; the pin block scrolls past its visible window
+mod clip;
+mod layout;
+use clip::{
+    add_image, add_text, dib_to_rgba, escape, fit_box, make_preview, safe_row_text, scale_bgra,
+    scrub_clip, scrub_string, suggest_label, unescape, Clip, ImageClip, MAX_HISTORY,
+    MAX_PINS,
+};
 // The history/pins split is dynamic: pins are the reused clips, so they claim
-// the rows they actually need (up to PIN_MAX_VISIBLE) and history takes what
-// is left of TOTAL_VISIBLE. With 8 or fewer pins this matches the old fixed
-// 20/8 layout exactly, and the popup never grows taller than it could before.
-const HIST_MAX_VISIBLE: usize = 20; // history rows shown before it scrolls
-const PIN_MAX_VISIBLE: usize = 20; // pin rows shown before the pin block scrolls
-const TOTAL_VISIBLE: usize = 28; // combined row budget (the old 20 + 8)
-
-/// Visible-row split for the popup within a `total` row budget (TOTAL_VISIBLE,
-/// or less when the monitor can't fit that): `(history_rows, pin_rows)`. Pins
-/// claim what they need up to their cap, but history always keeps room for up
-/// to 8 rows (fewer only when history itself is shorter).
-fn split_rows(hist: usize, pins: usize, total: usize) -> (usize, usize) {
-    let pvis = pins.min(PIN_MAX_VISIBLE).min(total.saturating_sub(hist.min(8)));
-    (hist.min(HIST_MAX_VISIBLE).min(total.saturating_sub(pvis)), pvis)
-}
-const SCROLL_STEP: usize = 3;
+// the rows they actually need and history takes what is left of the budget.
+use layout::{
+    build_rows, nav_step, pin_at_row, row_at, rows_height, Metrics, RowKind, VRow, SCROLL_STEP,
+    TOTAL_VISIBLE,
+};
 
 // Custom window messages.
 const WM_APP_TRAY: u32 = WM_APP + 1;
@@ -140,22 +131,6 @@ const HC_ACTION: i32 = 0;
 const ICON_BYTES: &[u8] = include_bytes!("../assets/clipstack.ico");
 
 // ---- Data model -----------------------------------------------------------
-
-struct ImageClip {
-    w: usize,
-    h: usize,
-    rgba: Vec<u8>, // full-resolution RGBA, for pasting back
-    tw: i32,       // thumbnail width
-    th: i32,       // thumbnail height
-    thumb: Vec<u8>, // top-down 32bpp BGRA thumbnail, for drawing
-    hash: u64,
-}
-
-#[derive(Clone)]
-enum Clip {
-    Text(String),
-    Image(Rc<ImageClip>),
-}
 
 struct Pin {
     label: String,
@@ -235,19 +210,6 @@ const PRESETS: [(usize, Trigger, &str); 3] = [
     (ID_TRIG_MOUSE4, Trigger::MOUSE4, "Mouse 4 (back)"),
     (ID_TRIG_MOUSE5, Trigger::MOUSE5, "Mouse 5 (forward)"),
 ];
-
-#[derive(Clone, Copy)]
-enum RowKind {
-    Sep,
-    Hist(usize),
-    Pin(usize),
-}
-
-struct VRow {
-    kind: RowKind,
-    top: i32,
-    bottom: i32,
-}
 
 struct App {
     hwnd: HWND,
@@ -564,163 +526,7 @@ fn vk_name(vk: u32) -> String {
     }
 }
 
-/// Collapse a string into a single-line preview (utf16, no NUL).
-fn make_preview(s: &str) -> Vec<u16> {
-    let mut out = String::new();
-    let mut prev_space = false;
-    for ch in s.chars() {
-        let c = if ch == '\r' || ch == '\n' || ch == '\t' { ' ' } else { ch };
-        if c == ' ' {
-            if prev_space {
-                continue;
-            }
-            prev_space = true;
-            out.push(' ');
-        } else if !c.is_control() {
-            prev_space = false;
-            out.push(c);
-        }
-        if out.chars().count() >= 160 {
-            break;
-        }
-    }
-    wide_no_nul(out.trim())
-}
-
 // ---- Clipboard history ----------------------------------------------------
-
-/// Box-filter RGBA -> top-down 32bpp BGRA at the given size: every source
-/// pixel in a destination pixel's footprint is averaged, which keeps
-/// downscaled screenshot text readable where nearest sampling shredded it.
-/// Shared by the row thumbnails and the hover preview.
-fn scale_bgra(w: usize, h: usize, rgba: &[u8], tw: usize, th: usize) -> Vec<u8> {
-    let mut out = vec![0u8; tw * th * 4];
-    for y in 0..th {
-        let sy0 = y * h / th;
-        let sy1 = ((y + 1) * h).div_ceil(th).min(h).max(sy0 + 1);
-        for x in 0..tw {
-            let sx0 = x * w / tw;
-            let sx1 = ((x + 1) * w).div_ceil(tw).min(w).max(sx0 + 1);
-            let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
-            for sy in sy0..sy1 {
-                for sx in sx0..sx1 {
-                    let si = (sy * w + sx) * 4;
-                    r += rgba[si] as u32;
-                    g += rgba[si + 1] as u32;
-                    b += rgba[si + 2] as u32;
-                }
-            }
-            let n = ((sy1 - sy0) * (sx1 - sx0)) as u32;
-            let di = (y * tw + x) * 4;
-            out[di] = (b / n) as u8;
-            out[di + 1] = (g / n) as u8;
-            out[di + 2] = (r / n) as u8;
-            out[di + 3] = 255;
-        }
-    }
-    out
-}
-
-/// Shrink (never grow) `w x h` to fit inside `max_w x max_h`.
-fn fit_box(w: usize, h: usize, max_w: usize, max_h: usize) -> (usize, usize) {
-    let (max_w, max_h) = (max_w.max(1), max_h.max(1));
-    if w <= max_w && h <= max_h {
-        return (w.max(1), h.max(1));
-    }
-    let s = (max_w as f32 / w.max(1) as f32).min(max_h as f32 / h.max(1) as f32);
-    (((w as f32 * s) as usize).max(1), ((h as f32 * s) as usize).max(1))
-}
-
-fn make_thumb(w: usize, h: usize, rgba: &[u8]) -> (i32, i32, Vec<u8>) {
-    const BASE_H: usize = 40;
-    const MAX_W: usize = 120;
-    let (mut tw, mut th) = (w, h);
-    if h > BASE_H || w > MAX_W {
-        let scale = BASE_H as f32 / h as f32;
-        th = BASE_H;
-        tw = ((w as f32) * scale).round() as usize;
-        if tw > MAX_W {
-            let s2 = MAX_W as f32 / tw as f32;
-            tw = MAX_W;
-            th = ((th as f32) * s2).round() as usize;
-        }
-    }
-    tw = tw.max(1);
-    th = th.max(1);
-    let out = scale_bgra(w, h, rgba, tw, th);
-    (tw as i32, th as i32, out)
-}
-
-fn add_text(a: &mut App, t: String) {
-    a.history_dirty = true;
-    if let Some(pos) = a
-        .history
-        .iter()
-        .position(|c| matches!(c, Clip::Text(s) if s == &t))
-    {
-        let c = a.history.remove(pos);
-        a.history.insert(0, c);
-        return;
-    }
-    a.history.insert(0, Clip::Text(t));
-    while a.history.len() > MAX_HISTORY {
-        if let Some(mut c) = a.history.pop() {
-            scrub_clip(&mut c);
-        }
-    }
-}
-
-fn add_image(a: &mut App, w: usize, h: usize, rgba: Vec<u8>) {
-    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
-        return;
-    }
-    let mut hasher = DefaultHasher::new();
-    w.hash(&mut hasher);
-    h.hash(&mut hasher);
-    rgba.hash(&mut hasher);
-    let hash = hasher.finish();
-    if let Some(pos) = a
-        .history
-        .iter()
-        .position(|c| matches!(c, Clip::Image(ic) if ic.hash == hash))
-    {
-        let c = a.history.remove(pos);
-        a.history.insert(0, c);
-        return;
-    }
-    let (tw, th, thumb) = make_thumb(w, h, &rgba);
-    a.history.insert(
-        0,
-        Clip::Image(Rc::new(ImageClip { w, h, rgba, tw, th, thumb, hash })),
-    );
-    while a.history.len() > MAX_HISTORY {
-        if let Some(mut c) = a.history.pop() {
-            scrub_clip(&mut c);
-        }
-    }
-}
-
-/// Best-effort wipe of a String's backing bytes before it is dropped.
-fn scrub_string(s: &mut String) {
-    unsafe {
-        for b in s.as_mut_vec() {
-            *b = 0;
-        }
-    }
-    s.clear();
-}
-
-fn scrub_clip(c: &mut Clip) {
-    match c {
-        Clip::Text(s) => scrub_string(s),
-        Clip::Image(ic) => {
-            if let Some(ic) = Rc::get_mut(ic) {
-                ic.rgba.iter_mut().for_each(|b| *b = 0);
-                ic.thumb.iter_mut().for_each(|b| *b = 0);
-            }
-        }
-    }
-}
 
 fn poll_clip(a: &mut App) {
     let seq = unsafe { GetClipboardSequenceNumber() };
@@ -746,10 +552,13 @@ fn poll_clip(a: &mut App) {
     a.poll_misses = 0;
     a.last_seq = seq;
     match (img, txt) {
-        (Some((w, h, rgba)), _) => add_image(a, w, h, rgba),
-        (None, Some(t)) if !t.is_empty() => add_text(a, t),
-        _ => {}
+        (Some((w, h, rgba)), _) => add_image(&mut a.history, w, h, rgba),
+        (None, Some(t)) if !t.is_empty() => add_text(&mut a.history, t),
+        _ => return, // nothing ingested, so nothing to flush
     }
+    // Marked for both kinds: an image push can evict a text clip past the cap,
+    // and without a flush the evicted plaintext would linger in history.dat.
+    a.history_dirty = true;
 }
 
 /// Returns false if the clip could not be placed on the clipboard, in which
@@ -799,75 +608,6 @@ unsafe fn clip_get_image() -> Option<(usize, usize, Vec<u8>)> {
         }
     }
     out
-}
-
-/// Parse a packed DIB (header + optional masks/palette + pixels) into RGBA.
-/// Defensive against malformed clipboard data: every offset is bounds-checked
-/// and the dimensions are capped, so a bad DIB yields None, never UB. Handles
-/// 24- and 32-bit BI_RGB / BI_BITFIELDS, what real apps put on the clipboard.
-fn dib_to_rgba(d: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
-    if d.len() < 40 {
-        return None;
-    }
-    let u32_at = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
-    let i32_at = |o: usize| i32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
-    let u16_at = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]);
-
-    let hdr = u32_at(0) as usize; // biSize
-    if !(40..=d.len()).contains(&hdr) {
-        return None;
-    }
-    let width = i32_at(4);
-    let height = i32_at(8);
-    let bpp = u16_at(14) as usize;
-    let compression = u32_at(16);
-    let clr_used = u32_at(32) as usize;
-
-    if width <= 0 || height == 0 || (bpp != 24 && bpp != 32) {
-        return None;
-    }
-    if compression != 0 && compression != 3 {
-        return None; // only BI_RGB / BI_BITFIELDS
-    }
-    let w = width as usize;
-    let h = height.unsigned_abs() as usize;
-    let top_down = height < 0;
-    if w.checked_mul(h)? > 64_000_000 {
-        return None; // sane ~64 MP cap against a hostile header
-    }
-
-    let masks = if compression == 3 { 12 } else { 0 };
-    // Fully checked so a hostile clrUsed can't overflow the offset (matters only
-    // on a hypothetical 32-bit build; harmless and clearer on x86_64).
-    let pix_off = hdr
-        .checked_add(masks)?
-        .checked_add(clr_used.checked_mul(4)?)?;
-    let stride = (w * bpp).div_ceil(32) * 4; // rows are DWORD-aligned
-    if pix_off.checked_add(stride.checked_mul(h)?)? > d.len() {
-        return None;
-    }
-
-    let bytespp = bpp / 8;
-    let mut out = vec![0u8; w * h * 4];
-    for row in 0..h {
-        let sy = if top_down { row } else { h - 1 - row };
-        let src = pix_off + sy * stride;
-        for x in 0..w {
-            let s = src + x * bytespp;
-            let o = (row * w + x) * 4;
-            out[o] = d[s + 2]; // R <- DIB byte order is BGRA
-            out[o + 1] = d[s + 1]; // G
-            out[o + 2] = d[s]; // B
-            out[o + 3] = if bpp == 32 { d[s + 3] } else { 255 };
-        }
-    }
-    // 32-bit DIBs often leave alpha as 0 (undefined); treat all-zero as opaque.
-    if bpp == 32 && out.chunks_exact(4).all(|p| p[3] == 0) {
-        for p in out.chunks_exact_mut(4) {
-            p[3] = 255;
-        }
-    }
-    Some((w, h, out))
 }
 
 /// Put text on the clipboard (CF_UNICODETEXT). When `exclude` is set, pasting a
@@ -1061,33 +801,6 @@ fn scrub_pin(p: &mut Pin) {
     }
     p.secret_enc.clear();
     p.len = 0;
-}
-
-fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-}
-
-fn unescape(s: &str) -> String {
-    let mut out = String::new();
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('t') => out.push('\t'),
-                Some('\\') => out.push('\\'),
-                Some(other) => out.push(other),
-                None => {}
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// Path to a per-user file under %LOCALAPPDATA%\ClipStack, creating the
@@ -1431,58 +1144,25 @@ fn set_startup(on: bool) {
 
 // ---- Layout & paint -------------------------------------------------------
 
+/// Lay the popup out for the current history and pins, storing the clamped
+/// scroll offsets and the split back on the app. The geometry itself lives in
+/// `layout::build_rows`; this only moves values in and out of `App`.
 fn rebuild_rows(a: &mut App) {
-    a.rows.clear();
-    let n = a.history.len();
-    let m = a.pins.len();
-    let (vis, pvis) = split_rows(n, m, a.row_budget);
-    (a.vis, a.pin_vis) = (vis, pvis); // scrolling/nav/thumbs read the live split
-    if a.arm_delete.is_some_and(|j| j >= m) {
+    let m = Metrics { item_h: a.item_h, sep_h: a.sep_h, pad: a.pad };
+    let laid = build_rows(
+        a.history.len(),
+        a.pins.len(),
+        a.row_budget,
+        a.scroll,
+        a.pin_scroll,
+        m,
+    );
+    if a.arm_delete.is_some_and(|j| j >= a.pins.len()) {
         a.arm_delete = None; // the armed pin is gone
     }
-    let max_scroll = n.saturating_sub(vis);
-    if a.scroll > max_scroll {
-        a.scroll = max_scroll;
-    }
-    let mut y = a.pad;
-    for i in a.scroll..a.scroll + vis {
-        a.rows.push(VRow { kind: RowKind::Hist(i), top: y, bottom: y + a.item_h });
-        y += a.item_h;
-    }
-    if m > 0 {
-        a.rows.push(VRow { kind: RowKind::Sep, top: y, bottom: y + a.sep_h });
-        y += a.sep_h;
-        a.pin_scroll = a.pin_scroll.min(m - pvis); // pvis <= m, so no underflow
-        for j in a.pin_scroll..a.pin_scroll + pvis {
-            a.rows.push(VRow { kind: RowKind::Pin(j), top: y, bottom: y + a.item_h });
-            y += a.item_h;
-        }
-    }
-}
-
-fn rows_height(a: &App) -> i32 {
-    a.rows.last().map(|r| r.bottom).unwrap_or(a.pad) + a.pad
-}
-
-/// Pin index of `row`, if that row is a pin. Used to keep the armed delete
-/// pointed at a pin rather than at a screen position.
-fn pin_at_row(a: &App, row: i32) -> Option<usize> {
-    match usize::try_from(row).ok().and_then(|r| a.rows.get(r))?.kind {
-        RowKind::Pin(j) => Some(j),
-        _ => None,
-    }
-}
-
-fn row_at(a: &App, y: i32) -> Option<usize> {
-    for (idx, r) in a.rows.iter().enumerate() {
-        if y >= r.top && y < r.bottom {
-            return match r.kind {
-                RowKind::Sep => None,
-                _ => Some(idx),
-            };
-        }
-    }
-    None
+    a.rows = laid.rows;
+    (a.vis, a.pin_vis) = (laid.vis, laid.pin_vis);
+    (a.scroll, a.pin_scroll) = (laid.scroll, laid.pin_scroll);
 }
 
 /// Screen position of the text caret in `target`'s thread, or the mouse cursor
@@ -1505,55 +1185,6 @@ unsafe fn caret_or_cursor(target: HWND) -> (i32, i32) {
     (pt.x, pt.y)
 }
 
-/// One Up/Down step through the visible rows: the new selection plus history
-/// and pin scroll deltas (each -1, 0, or 1). At a section edge the section
-/// scrolls first (revealing the next item under a fixed selection); only past
-/// its true end does the selection cross into the neighboring section.
-/// `can_scroll_*` say whether that section has one more item in the direction
-/// of travel.
-fn nav_step(
-    rows: &[VRow],
-    hovered: i32,
-    down: bool,
-    can_scroll_hist: bool,
-    can_scroll_pins: bool,
-) -> (i32, i32, i32) {
-    let sel_ok = |i: usize| !matches!(rows[i].kind, RowKind::Sep);
-    let cur = match usize::try_from(hovered).ok().filter(|&i| i < rows.len() && sel_ok(i)) {
-        Some(i) => i,
-        None => {
-            // Nothing selected yet: enter the list at the near end.
-            let first = if down {
-                (0..rows.len()).find(|&i| sel_ok(i))
-            } else {
-                (0..rows.len()).rev().find(|&i| sel_ok(i))
-            };
-            return (first.map_or(-1, |i| i as i32), 0, 0);
-        }
-    };
-    let step = |from: usize| {
-        if down {
-            (from + 1..rows.len()).find(|&i| sel_ok(i))
-        } else {
-            (0..from).rev().find(|&i| sel_ok(i))
-        }
-    };
-    let in_hist = matches!(rows[cur].kind, RowKind::Hist(_));
-    let at_edge = match step(cur) {
-        None => true,
-        Some(j) => matches!(rows[j].kind, RowKind::Hist(_)) != in_hist,
-    };
-    if at_edge {
-        let d = if down { 1 } else { -1 };
-        if in_hist && can_scroll_hist {
-            return (cur as i32, d, 0);
-        }
-        if !in_hist && can_scroll_pins {
-            return (cur as i32, 0, d);
-        }
-    }
-    (step(cur).map_or(cur as i32, |j| j as i32), 0, 0)
-}
 
 // ---- Image hover preview ---------------------------------------------------
 
@@ -1667,7 +1298,7 @@ fn show_popup(a: &mut App, cx: i32, cy: i32) {
     a.scroll = 0;
     a.pin_scroll = 0;
     rebuild_rows(a);
-    let height = rows_height(a);
+    let height = rows_height(&a.rows, a.pad);
 
     unsafe { place_and_show(a, cx, cy, height) };
     a.hovered = -1;
@@ -1752,7 +1383,7 @@ fn relayout(a: &mut App) {
         hide_popup(a);
         return;
     }
-    let height = rows_height(a);
+    let height = rows_height(&a.rows, a.pad);
     unsafe {
         SetWindowPos(a.hwnd, HWND_TOPMOST, a.popup_x, a.popup_y, a.width, height, SWP_NOACTIVATE);
         round_window(a.hwnd, a.width, height);
@@ -1806,37 +1437,6 @@ unsafe fn fill_color(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, col
     let r = RECT { left, top, right, bottom };
     FillRect(hdc, &r, b);
     DeleteObject(b as _);
-}
-
-/// A malformed clip (control characters, line/paragraph separators, lone UTF-16
-/// surrogates, or an absurd length) can crash DrawTextW deep inside USER32's
-/// text engine. Build a safe, capped copy for anything we render in a row. A row
-/// only ever shows one ellipsized line, so capping well above the visible width
-/// loses nothing.
-fn safe_row_text(text: &[u16]) -> Vec<u16> {
-    let mut out = Vec::with_capacity(text.len().min(256));
-    let mut i = 0;
-    while i < text.len() && out.len() < 256 {
-        let c = text[i];
-        if (0xD800..=0xDBFF).contains(&c) {
-            // High surrogate: keep only if a low surrogate follows.
-            if i + 1 < text.len() && (0xDC00..=0xDFFF).contains(&text[i + 1]) {
-                out.push(c);
-                out.push(text[i + 1]);
-                i += 2;
-                continue;
-            }
-            out.push(0xFFFD);
-        } else if (0xDC00..=0xDFFF).contains(&c) {
-            out.push(0xFFFD); // lone low surrogate
-        } else if c < 0x20 || c == 0x7F || c == 0x0085 || c == 0x2028 || c == 0x2029 {
-            out.push(0x20); // control chars + line/paragraph separators
-        } else {
-            out.push(c);
-        }
-        i += 1;
-    }
-    out
 }
 
 unsafe fn draw_text_row(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, text: &[u16]) {
@@ -2010,13 +1610,6 @@ unsafe fn open_url(hwnd: HWND, url: &str) {
     let verb = wide("open");
     let u = wide(url);
     ShellExecuteW(hwnd, verb.as_ptr(), u.as_ptr(), null(), null(), SW_SHOWNORMAL);
-}
-
-/// Suggested pin label from the clip text: first line, trimmed, capped short
-/// enough that a pasted blob or key can't become a label by accident.
-fn suggest_label(s: &str) -> String {
-    let line: String = s.lines().next().unwrap_or("").trim().chars().take(40).collect();
-    line.trim_end().to_string()
 }
 
 /// Begin inline pin-labeling for history item `i` (text clips only, up to
@@ -2839,6 +2432,544 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
 
 // ---- Popup window procedure -----------------------------------------------
 
+unsafe fn on_scroll(hwnd: HWND, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        let mut a = app();
+        if a.edit.is_some() {
+            return 0; // freeze the list while labeling so indices can't shift
+        }
+        let (old_scroll, old_pin) = (a.scroll, a.pin_scroll);
+        // Scroll whichever section the cursor is over: pins (below the
+        // separator) or history (above it).
+        let cy = lp as i32 - a.popup_y;
+        let sep_top = a
+            .rows
+            .iter()
+            .find_map(|r| matches!(r.kind, RowKind::Sep).then_some(r.top));
+        let over_pins = sep_top.is_some_and(|t| cy >= t);
+        match (over_pins, wp) {
+            (true, 1) => a.pin_scroll = a.pin_scroll.saturating_sub(SCROLL_STEP),
+            (true, 2) => {
+                let max = a.pins.len().saturating_sub(a.pin_vis);
+                a.pin_scroll = (a.pin_scroll + SCROLL_STEP).min(max);
+            }
+            (false, 1) => a.scroll = a.scroll.saturating_sub(SCROLL_STEP),
+            (false, 2) => {
+                let max = a.history.len().saturating_sub(a.vis);
+                a.scroll = (a.scroll + SCROLL_STEP).min(max);
+            }
+            _ => {}
+        }
+        if a.scroll == old_scroll && a.pin_scroll == old_pin {
+            return 0; // already at the end in that direction: nothing moved, so no
+                      // rebuild and no repaint, which is what caused the end flicker
+        }
+        a.hovered = -1;
+        hide_preview(&mut a);
+        KillTimer(hwnd, TIMER_PREVIEW);
+        rebuild_rows(&mut a);
+        InvalidateRect(hwnd, null(), 1);
+        0
+}
+
+unsafe fn on_timer(hwnd: HWND, wp: WPARAM) -> LRESULT {
+        if wp == TIMER_PREVIEW {
+            KillTimer(hwnd, TIMER_PREVIEW); // one-shot
+            // Build the scaled preview inside the borrow, place and show the
+            // panel outside it (SetWindowPos can dispatch messages).
+            let show = {
+                let mut a = app();
+                preview_target(&a).map(|i| {
+                    let ic = match &a.history[i] {
+                        Clip::Image(ic) => ic.clone(),
+                        _ => unreachable!(),
+                    };
+                    // Size to the real estate beside the popup (whichever
+                    // side is wider), full work-area height minus margins.
+                    // Small images render 1:1, never upscaled.
+                    let wa = work_area_at(a.popup_x, a.popup_y);
+                    let gap = 8;
+                    let margin = a.pad * 2;
+                    let right_space =
+                        (wa.right - (a.popup_x + a.width + gap) - margin).max(0) as usize;
+                    let left_space = (a.popup_x - gap - wa.left - margin).max(0) as usize;
+                    let cap_w = right_space.max(left_space).max(64);
+                    let cap_h = (wa.bottom - wa.top - margin * 2).max(64) as usize;
+                    let (pw, ph) = fit_box(ic.w, ic.h, cap_w, cap_h);
+                    let buf = scale_bgra(ic.w, ic.h, &ic.rgba, pw, ph);
+                    let row_top = usize::try_from(a.hovered)
+                        .ok()
+                        .and_then(|r| a.rows.get(r))
+                        .map_or(0, |r| r.top);
+                    let fits_right = pw <= right_space;
+                    a.preview = Some((i, pw as i32, ph as i32, buf));
+                    (a.preview_hwnd, a.popup_x, a.popup_y, a.width, row_top, pw as i32, ph as i32, fits_right)
+                })
+            };
+            if let Some((phwnd, px, py, pwidth, row_top, w, h, fits_right)) = show {
+                let wa = work_area_at(px, py);
+                let gap = 8;
+                let x = if fits_right {
+                    px + pwidth + gap
+                } else {
+                    (px - gap - w).max(wa.left)
+                };
+                let y = (py + row_top).min(wa.bottom - h).max(wa.top);
+                SetWindowPos(phwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                InvalidateRect(phwnd, null(), 0);
+            }
+            return 0;
+        }
+        if wp == TIMER_CLIP {
+            let mut a = app();
+            if a.edit.is_some() {
+                // Blink the label caret while editing.
+                a.caret_on = !a.caret_on;
+                InvalidateRect(hwnd, null(), 0);
+            } else if !a.visible {
+                // Don't ingest new clips while the popup is open, it would
+                // shift the history indices the on-screen rows point at.
+                poll_clip(&mut a);
+            }
+            if a.toast.is_some() {
+                a.toast_ticks = a.toast_ticks.saturating_sub(1);
+                if a.toast_ticks == 0 {
+                    a.toast = None;
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
+            // Flush history to disk if it changed and persistence is on. The
+            // ~0.5s cadence means a crash loses at most half a second.
+            if a.persist && a.history_dirty {
+                save_history(&a);
+                a.history_dirty = false;
+            }
+        }
+        0
+}
+
+unsafe fn on_mouse_move(hwnd: HWND, lp: LPARAM) -> LRESULT {
+        let mut a = app();
+        if a.edit.is_some() {
+            return 0; // no hover changes while a label field is open
+        }
+        let (_, y) = lo_hi(lp);
+        if !a.tracking_leave {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut tme);
+            a.tracking_leave = true;
+        }
+        let row = row_at(&a.rows, y).map(|i| i as i32).unwrap_or(-1);
+        if row != a.hovered {
+            let old = a.hovered;
+            a.hovered = row;
+            if a.arm_delete.is_some() && a.arm_delete != pin_at_row(&a.rows, row) {
+                a.arm_delete = None; // moved off the armed pin: disarm it
+            }
+            // Repaint only the two affected rows so the rest of the list
+            // doesn't flash on hover.
+            for r in [old, row] {
+                if let Some(vr) = usize::try_from(r).ok().and_then(|i| a.rows.get(i)) {
+                    let rc = RECT { left: 0, top: vr.top, right: a.width, bottom: vr.bottom };
+                    InvalidateRect(hwnd, &rc, 1);
+                }
+            }
+            queue_preview(&mut a);
+        }
+        0
+}
+
+unsafe fn on_lbutton_up(hwnd: HWND, lp: LPARAM) -> LRESULT {
+        if app().about {
+            let (_, y) = lo_hi(lp);
+            let lay = about_layout(&app());
+            if y >= lay.web.0 && y < lay.web.1 {
+                open_url(hwnd, "https://hologramhacks.com");
+            } else if y >= lay.gh.0 && y < lay.gh.1 {
+                open_url(hwnd, "https://github.com/HologramHacks/clipstack");
+            } else {
+                hide_popup(&mut app());
+            }
+            return 0;
+        }
+        if app().edit.is_some() {
+            return 0; // ignore clicks on rows while labeling; Enter/Esc only
+        }
+        let (x, y) = lo_hi(lp);
+        enum Act {
+            Paste(HWND),
+            Pin(usize),
+            MovePin(usize, bool, bool),
+            None,
+        }
+        let act = {
+            let mut a = app();
+            let was_armed = a.arm_delete;
+            a.arm_delete = None; // any click disarms a pending pin-delete by default
+            match row_at(&a.rows, y) {
+                Some(idx) if x >= a.width - a.item_h => {
+                    // Clicked the ✕ on the right edge. Pins require a confirming
+                    // second click: the first click arms it (history deletes in one).
+                    // The arm tracks the PIN index, not the row: rows are rebuilt by
+                    // scrolling, so a row-keyed arm would re-point at whatever pin
+                    // scrolled into that slot and delete it on the confirming click.
+                    match a.rows[idx].kind {
+                        RowKind::Pin(j) if was_armed != Some(j) => {
+                            a.arm_delete = Some(j);
+                            InvalidateRect(a.hwnd, null(), 1);
+                            Act::None
+                        }
+                        _ => {
+                            delete_row(&mut a, idx);
+                            if a.history.is_empty() && a.pins.is_empty() {
+                                hide_popup(&mut a);
+                            } else {
+                                relayout(&mut a);
+                            }
+                            Act::None
+                        }
+                    }
+                }
+                Some(idx) if x >= a.width - a.item_h * 2 => {
+                    // The affordance column: text history rows pin here; pin
+                    // rows move up (top half) or down (bottom half).
+                    match a.rows[idx].kind {
+                        RowKind::Hist(i) if matches!(a.history.get(i), Some(Clip::Text(_))) => {
+                            Act::Pin(i)
+                        }
+                        RowKind::Pin(j) => {
+                            let r = &a.rows[idx];
+                            let up = y < (r.top + r.bottom) / 2;
+                            Act::MovePin(j, up, cur_mods() & M_SHIFT != 0)
+                        }
+                        _ => Act::Paste(commit_row(&mut a, idx)),
+                    }
+                }
+                Some(idx) => Act::Paste(commit_row(&mut a, idx)),
+                None => Act::None,
+            }
+        };
+        match act {
+            Act::Paste(target) if !target.is_null() => {
+                SetForegroundWindow(target);
+                std::thread::sleep(Duration::from_millis(40));
+                send_combo(0x56); // Ctrl+V
+            }
+            Act::Pin(i) => start_pin(i),
+            Act::MovePin(j, up, to_end) => move_pin(j, up, to_end),
+            _ => {}
+        }
+        0
+}
+
+unsafe fn on_key_down(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        if app().capturing {
+            let vk = wp as u32;
+            // Apply via the same WM_APP_CAPTURED channel the mouse hook uses,
+            // so both capture paths funnel through one handler.
+            if vk == 0x1B {
+                PostMessageW(hwnd, WM_APP_CAPTURED, 0, 0); // Esc cancels
+            } else if !is_modifier_vk(vk) {
+                let mods = cur_mods();
+                if mods != 0 {
+                    let w = encode_trigger(Trigger::Key { vk, mods });
+                    PostMessageW(hwnd, WM_APP_CAPTURED, w, 0);
+                }
+                // bare key (no modifier) is rejected by the guardrail; wait
+            }
+            return 0;
+        }
+        // Keyboard navigation: only reachable when the popup holds focus,
+        // which only a hotkey-open grants (mouse-opened popups never get keys).
+        if msg == WM_KEYDOWN && {
+            let a = app();
+            a.visible && a.edit.is_none() && !a.about && a.kb_focus
+        } {
+            enum KAct {
+                None,
+                Paste(HWND),
+                Dismiss(HWND),
+            }
+            let act = {
+                let mut a = app();
+                match wp as u16 {
+                    0x26 | 0x28 => {
+                        // VK_UP / VK_DOWN
+                        let down = wp as u16 == 0x28;
+                        let (can_h, can_p) = if down {
+                            (
+                                a.scroll + a.vis < a.history.len(),
+                                a.pin_scroll + a.pin_vis < a.pins.len(),
+                            )
+                        } else {
+                            (a.scroll > 0, a.pin_scroll > 0)
+                        };
+                        let (sel, dh, dp) = nav_step(&a.rows, a.hovered, down, can_h, can_p);
+                        if dh != 0 || dp != 0 {
+                            a.scroll = (a.scroll as i32 + dh) as usize;
+                            a.pin_scroll = (a.pin_scroll as i32 + dp) as usize;
+                            rebuild_rows(&mut a);
+                        }
+                        a.hovered = sel;
+                        queue_preview(&mut a);
+                        InvalidateRect(hwnd, null(), 0);
+                        KAct::None
+                    }
+                    0x09 => {
+                        // VK_TAB: jump between the history and pin sections.
+                        let in_pins = usize::try_from(a.hovered)
+                            .ok()
+                            .and_then(|i| a.rows.get(i))
+                            .is_some_and(|r| matches!(r.kind, RowKind::Pin(_)));
+                        let jump = a.rows.iter().position(|r| {
+                            if in_pins {
+                                matches!(r.kind, RowKind::Hist(_))
+                            } else {
+                                matches!(r.kind, RowKind::Pin(_))
+                            }
+                        });
+                        if let Some(j) = jump {
+                            a.hovered = j as i32;
+                            queue_preview(&mut a);
+                            InvalidateRect(hwnd, null(), 0);
+                        }
+                        KAct::None
+                    }
+                    0x0D => {
+                        // VK_RETURN: paste the selected row into the app the
+                        // user came from.
+                        let idx = usize::try_from(a.hovered)
+                            .ok()
+                            .filter(|&i| i < a.rows.len())
+                            .filter(|&i| !matches!(a.rows[i].kind, RowKind::Sep));
+                        match idx {
+                            Some(i) => KAct::Paste(commit_row(&mut a, i)),
+                            None => KAct::None,
+                        }
+                    }
+                    0x1B => {
+                        // VK_ESCAPE: dismiss, hand focus back untouched.
+                        let restore = a.target;
+                        hide_popup(&mut a);
+                        KAct::Dismiss(restore)
+                    }
+                    _ => KAct::None,
+                }
+            };
+            match act {
+                KAct::Paste(target) if !target.is_null() => {
+                    SetForegroundWindow(target);
+                    std::thread::sleep(Duration::from_millis(40));
+                    send_combo(0x56); // Ctrl+V
+                }
+                KAct::Dismiss(restore) if !restore.is_null() => {
+                    SetForegroundWindow(restore);
+                }
+                _ => {}
+            }
+            return 0;
+        }
+        if msg == WM_KEYDOWN && app().edit.is_some() {
+            match wp as u16 {
+                0x1B => end_edit(false), // VK_ESCAPE: cancel
+                0x0D => {
+                    // VK_RETURN: pin only when the trimmed label is non-empty.
+                    // On empty-Enter we intentionally do nothing, keeping the
+                    // field open to keep typing, rather than calling end_edit
+                    // (which would close it). Don't "simplify" into end_edit(true).
+                    let ready = app().edit.as_ref().is_some_and(|e| {
+                        !String::from_utf16_lossy(&e.label).trim().is_empty()
+                    });
+                    if ready {
+                        end_edit(true);
+                    }
+                }
+                _ => {}
+            }
+            return 0;
+        }
+        DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+unsafe fn on_char(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        if app().edit.is_none() {
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        match wp as u16 {
+            0x08 => {
+                // Backspace: a preselected label clears whole (it's one
+                // selection); otherwise drop the last code unit (plus its
+                // surrogate pair).
+                let mut a = app();
+                if let Some(e) = a.edit.as_mut() {
+                    if e.preselected {
+                        e.label.clear();
+                        e.preselected = false;
+                    } else if let Some(last) = e.label.pop() {
+                        if (0xDC00..=0xDFFF).contains(&last)
+                            && matches!(e.label.last(), Some(&p) if (0xD800..=0xDBFF).contains(&p)) {
+                                e.label.pop();
+                            }
+                    }
+                }
+                a.caret_on = true;
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0x1B | 0x0D | 0x09 => {} // Esc/Enter handled in WM_KEYDOWN; ignore Tab
+            c if c < 0x20 => {}      // ignore other control chars
+            c => {
+                let mut a = app();
+                if let Some(e) = a.edit.as_mut() {
+                    if e.preselected {
+                        // First keystroke replaces the preselected suggestion.
+                        e.label.clear();
+                        e.preselected = false;
+                    }
+                    if e.label.len() < 200 {
+                        e.label.push(c);
+                    }
+                }
+                a.caret_on = true;
+                InvalidateRect(hwnd, null(), 0);
+            }
+        }
+        0
+}
+
+unsafe fn on_hotkey() -> LRESULT {
+        enum HAct {
+            None,
+            Focus(HWND),   // popup opened: grab keyboard focus for nav
+            Dismiss(HWND), // hotkey while open acts as a toggle
+        }
+        let act = {
+            let mut a = app();
+            if a.paused || a.capturing {
+                HAct::None
+            } else if a.visible {
+                let restore = a.target;
+                hide_popup(&mut a);
+                HAct::Dismiss(restore)
+            } else {
+                a.target = GetForegroundWindow();
+                let (x, y) = caret_or_cursor(a.target);
+                show_popup(&mut a, x, y);
+                if a.visible {
+                    // Start the selection on the first row so arrows work
+                    // immediately.
+                    a.hovered = a
+                        .rows
+                        .iter()
+                        .position(|r| !matches!(r.kind, RowKind::Sep))
+                        .map_or(-1, |i| i as i32);
+                    a.kb_focus = true;
+                    HAct::Focus(a.hwnd)
+                } else {
+                    HAct::None // nothing to show (empty history + pins)
+                }
+            }
+        };
+        // Focus calls outside the borrow: they can deliver messages
+        // synchronously (see the WM_KILLFOCUS lesson).
+        match act {
+            HAct::Focus(hwnd2) => {
+                set_no_activate(hwnd2, false);
+                SetForegroundWindow(hwnd2);
+                SetFocus(hwnd2);
+            }
+            HAct::Dismiss(restore) => {
+                if !restore.is_null() {
+                    SetForegroundWindow(restore);
+                }
+            }
+            HAct::None => {}
+        }
+        0
+}
+
+unsafe fn on_command(hwnd: HWND, wp: WPARAM) -> LRESULT {
+        match wp & 0xffff {
+            ID_PAUSE => {
+                let mut a = app();
+                a.paused = !a.paused;
+                if a.paused {
+                    hide_popup(&mut a);
+                }
+                reconcile_input(&mut a); // pause fully removes the hook/hotkey
+            }
+            ID_CLEAR => {
+                let mut a = app();
+                a.history.iter_mut().for_each(scrub_clip);
+                a.history.clear();
+                a.history_dirty = false;
+                if a.persist {
+                    clear_history_file(); // wipe the persisted copy too
+                }
+                hide_popup(&mut a);
+            }
+            ID_QUIT => {
+                DestroyWindow(hwnd);
+            }
+            ID_ABOUT => {
+                let mut pt: POINT = std::mem::zeroed();
+                GetCursorPos(&mut pt);
+                show_about(&mut app(), pt.x, pt.y);
+            }
+            ID_STARTUP => set_startup(!startup_enabled()),
+            ID_PERSIST => {
+                let mut a = app();
+                a.persist = !a.persist;
+                save_settings(&a);
+                if a.persist {
+                    save_history(&a); // capture what's already in memory
+                } else {
+                    clear_history_file(); // stop remembering: delete the file
+                }
+            }
+            ID_AUTOCOPY => {
+                let mut a = app();
+                a.auto_copy = !a.auto_copy;
+                save_settings(&a);
+                reconcile_input(&mut a); // install/remove the hook for drag-watching
+            }
+            ID_KBOPEN => {
+                let (hwnd2, failed) = {
+                    let mut a = app();
+                    a.kb_open = !a.kb_open;
+                    reconcile_input(&mut a);
+                    save_settings(&a);
+                    // While paused nothing registers by design, that's not
+                    // a conflict.
+                    (a.hwnd, a.kb_open && !a.paused && !a.nav_active)
+                };
+                let desc = open_desc(&app());
+                update_tray_tip(hwnd2, &desc);
+                if failed {
+                    // Another app owns Ctrl+Shift+V; the setting stays on and
+                    // registration retries on the next resume/toggle.
+                    warn_hotkey_taken(hwnd2);
+                }
+            }
+            ID_TRIG_CUSTOM => start_capture(),
+            cmd => {
+                if let Some(&(_, t, _)) = PRESETS.iter().find(|&&(id, _, _)| id == cmd) {
+                    set_trigger(t);
+                } else if (ID_THEME_BASE..ID_THEME_BASE + THEMES.len()).contains(&cmd) {
+                    let mut a = app();
+                    a.theme_idx = cmd - ID_THEME_BASE;
+                    set_theme(a.theme_idx);
+                    save_settings(&a);
+                    InvalidateRect(a.hwnd, null(), 1); // repaint in the new theme
+                }
+            }
+        }
+        0
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_APP_SHOW => {
@@ -2853,154 +2984,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             send_combo(0x43); // Ctrl+C: copy the just-released selection; the timer poll ingests it
             0
         }
-        WM_APP_SCROLL => {
-            let mut a = app();
-            if a.edit.is_some() {
-                return 0; // freeze the list while labeling so indices can't shift
-            }
-            let (old_scroll, old_pin) = (a.scroll, a.pin_scroll);
-            // Scroll whichever section the cursor is over: pins (below the
-            // separator) or history (above it).
-            let cy = lp as i32 - a.popup_y;
-            let sep_top = a
-                .rows
-                .iter()
-                .find_map(|r| matches!(r.kind, RowKind::Sep).then_some(r.top));
-            let over_pins = sep_top.is_some_and(|t| cy >= t);
-            match (over_pins, wp) {
-                (true, 1) => a.pin_scroll = a.pin_scroll.saturating_sub(SCROLL_STEP),
-                (true, 2) => {
-                    let max = a.pins.len().saturating_sub(a.pin_vis);
-                    a.pin_scroll = (a.pin_scroll + SCROLL_STEP).min(max);
-                }
-                (false, 1) => a.scroll = a.scroll.saturating_sub(SCROLL_STEP),
-                (false, 2) => {
-                    let max = a.history.len().saturating_sub(a.vis);
-                    a.scroll = (a.scroll + SCROLL_STEP).min(max);
-                }
-                _ => {}
-            }
-            if a.scroll == old_scroll && a.pin_scroll == old_pin {
-                return 0; // already at the end in that direction: nothing moved, so no
-                          // rebuild and no repaint, which is what caused the end flicker
-            }
-            a.hovered = -1;
-            hide_preview(&mut a);
-            KillTimer(hwnd, TIMER_PREVIEW);
-            rebuild_rows(&mut a);
-            InvalidateRect(hwnd, null(), 1);
-            0
-        }
-        WM_TIMER => {
-            if wp == TIMER_PREVIEW {
-                KillTimer(hwnd, TIMER_PREVIEW); // one-shot
-                // Build the scaled preview inside the borrow, place and show the
-                // panel outside it (SetWindowPos can dispatch messages).
-                let show = {
-                    let mut a = app();
-                    preview_target(&a).map(|i| {
-                        let ic = match &a.history[i] {
-                            Clip::Image(ic) => ic.clone(),
-                            _ => unreachable!(),
-                        };
-                        // Size to the real estate beside the popup (whichever
-                        // side is wider), full work-area height minus margins.
-                        // Small images render 1:1, never upscaled.
-                        let wa = work_area_at(a.popup_x, a.popup_y);
-                        let gap = 8;
-                        let margin = a.pad * 2;
-                        let right_space =
-                            (wa.right - (a.popup_x + a.width + gap) - margin).max(0) as usize;
-                        let left_space = (a.popup_x - gap - wa.left - margin).max(0) as usize;
-                        let cap_w = right_space.max(left_space).max(64);
-                        let cap_h = (wa.bottom - wa.top - margin * 2).max(64) as usize;
-                        let (pw, ph) = fit_box(ic.w, ic.h, cap_w, cap_h);
-                        let buf = scale_bgra(ic.w, ic.h, &ic.rgba, pw, ph);
-                        let row_top = usize::try_from(a.hovered)
-                            .ok()
-                            .and_then(|r| a.rows.get(r))
-                            .map_or(0, |r| r.top);
-                        let fits_right = pw <= right_space;
-                        a.preview = Some((i, pw as i32, ph as i32, buf));
-                        (a.preview_hwnd, a.popup_x, a.popup_y, a.width, row_top, pw as i32, ph as i32, fits_right)
-                    })
-                };
-                if let Some((phwnd, px, py, pwidth, row_top, w, h, fits_right)) = show {
-                    let wa = work_area_at(px, py);
-                    let gap = 8;
-                    let x = if fits_right {
-                        px + pwidth + gap
-                    } else {
-                        (px - gap - w).max(wa.left)
-                    };
-                    let y = (py + row_top).min(wa.bottom - h).max(wa.top);
-                    SetWindowPos(phwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                    InvalidateRect(phwnd, null(), 0);
-                }
-                return 0;
-            }
-            if wp == TIMER_CLIP {
-                let mut a = app();
-                if a.edit.is_some() {
-                    // Blink the label caret while editing.
-                    a.caret_on = !a.caret_on;
-                    InvalidateRect(hwnd, null(), 0);
-                } else if !a.visible {
-                    // Don't ingest new clips while the popup is open, it would
-                    // shift the history indices the on-screen rows point at.
-                    poll_clip(&mut a);
-                }
-                if a.toast.is_some() {
-                    a.toast_ticks = a.toast_ticks.saturating_sub(1);
-                    if a.toast_ticks == 0 {
-                        a.toast = None;
-                        InvalidateRect(hwnd, null(), 0);
-                    }
-                }
-                // Flush history to disk if it changed and persistence is on. The
-                // ~0.5s cadence means a crash loses at most half a second.
-                if a.persist && a.history_dirty {
-                    save_history(&a);
-                    a.history_dirty = false;
-                }
-            }
-            0
-        }
-        WM_MOUSEMOVE => {
-            let mut a = app();
-            if a.edit.is_some() {
-                return 0; // no hover changes while a label field is open
-            }
-            let (_, y) = lo_hi(lp);
-            if !a.tracking_leave {
-                let mut tme = TRACKMOUSEEVENT {
-                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: hwnd,
-                    dwHoverTime: 0,
-                };
-                TrackMouseEvent(&mut tme);
-                a.tracking_leave = true;
-            }
-            let row = row_at(&a, y).map(|i| i as i32).unwrap_or(-1);
-            if row != a.hovered {
-                let old = a.hovered;
-                a.hovered = row;
-                if a.arm_delete.is_some() && a.arm_delete != pin_at_row(&a, row) {
-                    a.arm_delete = None; // moved off the armed pin: disarm it
-                }
-                // Repaint only the two affected rows so the rest of the list
-                // doesn't flash on hover.
-                for r in [old, row] {
-                    if let Some(vr) = usize::try_from(r).ok().and_then(|i| a.rows.get(i)) {
-                        let rc = RECT { left: 0, top: vr.top, right: a.width, bottom: vr.bottom };
-                        InvalidateRect(hwnd, &rc, 1);
-                    }
-                }
-                queue_preview(&mut a);
-            }
-            0
-        }
+        WM_APP_SCROLL => on_scroll(hwnd, wp, lp),
+        WM_TIMER => on_timer(hwnd, wp),
+        WM_MOUSEMOVE => on_mouse_move(hwnd, lp),
         WM_MOUSELEAVE => {
             let mut a = app();
             a.hovered = -1;
@@ -3032,88 +3018,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
-        WM_LBUTTONUP => {
-            if app().about {
-                let (_, y) = lo_hi(lp);
-                let lay = about_layout(&app());
-                if y >= lay.web.0 && y < lay.web.1 {
-                    open_url(hwnd, "https://hologramhacks.com");
-                } else if y >= lay.gh.0 && y < lay.gh.1 {
-                    open_url(hwnd, "https://github.com/HologramHacks/clipstack");
-                } else {
-                    hide_popup(&mut app());
-                }
-                return 0;
-            }
-            if app().edit.is_some() {
-                return 0; // ignore clicks on rows while labeling; Enter/Esc only
-            }
-            let (x, y) = lo_hi(lp);
-            enum Act {
-                Paste(HWND),
-                Pin(usize),
-                MovePin(usize, bool, bool),
-                None,
-            }
-            let act = {
-                let mut a = app();
-                let was_armed = a.arm_delete;
-                a.arm_delete = None; // any click disarms a pending pin-delete by default
-                match row_at(&a, y) {
-                    Some(idx) if x >= a.width - a.item_h => {
-                        // Clicked the ✕ on the right edge. Pins require a confirming
-                        // second click: the first click arms it (history deletes in one).
-                        // The arm tracks the PIN index, not the row: rows are rebuilt by
-                        // scrolling, so a row-keyed arm would re-point at whatever pin
-                        // scrolled into that slot and delete it on the confirming click.
-                        match a.rows[idx].kind {
-                            RowKind::Pin(j) if was_armed != Some(j) => {
-                                a.arm_delete = Some(j);
-                                InvalidateRect(a.hwnd, null(), 1);
-                                Act::None
-                            }
-                            _ => {
-                                delete_row(&mut a, idx);
-                                if a.history.is_empty() && a.pins.is_empty() {
-                                    hide_popup(&mut a);
-                                } else {
-                                    relayout(&mut a);
-                                }
-                                Act::None
-                            }
-                        }
-                    }
-                    Some(idx) if x >= a.width - a.item_h * 2 => {
-                        // The affordance column: text history rows pin here; pin
-                        // rows move up (top half) or down (bottom half).
-                        match a.rows[idx].kind {
-                            RowKind::Hist(i) if matches!(a.history.get(i), Some(Clip::Text(_))) => {
-                                Act::Pin(i)
-                            }
-                            RowKind::Pin(j) => {
-                                let r = &a.rows[idx];
-                                let up = y < (r.top + r.bottom) / 2;
-                                Act::MovePin(j, up, cur_mods() & M_SHIFT != 0)
-                            }
-                            _ => Act::Paste(commit_row(&mut a, idx)),
-                        }
-                    }
-                    Some(idx) => Act::Paste(commit_row(&mut a, idx)),
-                    None => Act::None,
-                }
-            };
-            match act {
-                Act::Paste(target) if !target.is_null() => {
-                    SetForegroundWindow(target);
-                    std::thread::sleep(Duration::from_millis(40));
-                    send_combo(0x56); // Ctrl+V
-                }
-                Act::Pin(i) => start_pin(i),
-                Act::MovePin(j, up, to_end) => move_pin(j, up, to_end),
-                _ => {}
-            }
-            0
-        }
+        WM_LBUTTONUP => on_lbutton_up(hwnd, lp),
         WM_RBUTTONUP => {
             if app().edit.is_some() {
                 return 0; // already labeling; ignore further right-clicks
@@ -3121,7 +3026,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let (_x, y) = lo_hi(lp);
             let kind = {
                 let a = app();
-                row_at(&a, y).map(|idx| a.rows[idx].kind)
+                row_at(&a.rows, y).map(|idx| a.rows[idx].kind)
             };
             match kind {
                 Some(RowKind::Pin(j)) => start_rename(j),
@@ -3130,232 +3035,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
-        WM_KEYDOWN | WM_SYSKEYDOWN => {
-            if app().capturing {
-                let vk = wp as u32;
-                // Apply via the same WM_APP_CAPTURED channel the mouse hook uses,
-                // so both capture paths funnel through one handler.
-                if vk == 0x1B {
-                    PostMessageW(hwnd, WM_APP_CAPTURED, 0, 0); // Esc cancels
-                } else if !is_modifier_vk(vk) {
-                    let mods = cur_mods();
-                    if mods != 0 {
-                        let w = encode_trigger(Trigger::Key { vk, mods });
-                        PostMessageW(hwnd, WM_APP_CAPTURED, w, 0);
-                    }
-                    // bare key (no modifier) is rejected by the guardrail; wait
-                }
-                return 0;
-            }
-            // Keyboard navigation: only reachable when the popup holds focus,
-            // which only a hotkey-open grants (mouse-opened popups never get keys).
-            if msg == WM_KEYDOWN && {
-                let a = app();
-                a.visible && a.edit.is_none() && !a.about && a.kb_focus
-            } {
-                enum KAct {
-                    None,
-                    Paste(HWND),
-                    Dismiss(HWND),
-                }
-                let act = {
-                    let mut a = app();
-                    match wp as u16 {
-                        0x26 | 0x28 => {
-                            // VK_UP / VK_DOWN
-                            let down = wp as u16 == 0x28;
-                            let (can_h, can_p) = if down {
-                                (
-                                    a.scroll + a.vis < a.history.len(),
-                                    a.pin_scroll + a.pin_vis < a.pins.len(),
-                                )
-                            } else {
-                                (a.scroll > 0, a.pin_scroll > 0)
-                            };
-                            let (sel, dh, dp) = nav_step(&a.rows, a.hovered, down, can_h, can_p);
-                            if dh != 0 || dp != 0 {
-                                a.scroll = (a.scroll as i32 + dh) as usize;
-                                a.pin_scroll = (a.pin_scroll as i32 + dp) as usize;
-                                rebuild_rows(&mut a);
-                            }
-                            a.hovered = sel;
-                            queue_preview(&mut a);
-                            InvalidateRect(hwnd, null(), 0);
-                            KAct::None
-                        }
-                        0x09 => {
-                            // VK_TAB: jump between the history and pin sections.
-                            let in_pins = usize::try_from(a.hovered)
-                                .ok()
-                                .and_then(|i| a.rows.get(i))
-                                .is_some_and(|r| matches!(r.kind, RowKind::Pin(_)));
-                            let jump = a.rows.iter().position(|r| {
-                                if in_pins {
-                                    matches!(r.kind, RowKind::Hist(_))
-                                } else {
-                                    matches!(r.kind, RowKind::Pin(_))
-                                }
-                            });
-                            if let Some(j) = jump {
-                                a.hovered = j as i32;
-                                queue_preview(&mut a);
-                                InvalidateRect(hwnd, null(), 0);
-                            }
-                            KAct::None
-                        }
-                        0x0D => {
-                            // VK_RETURN: paste the selected row into the app the
-                            // user came from.
-                            let idx = usize::try_from(a.hovered)
-                                .ok()
-                                .filter(|&i| i < a.rows.len())
-                                .filter(|&i| !matches!(a.rows[i].kind, RowKind::Sep));
-                            match idx {
-                                Some(i) => KAct::Paste(commit_row(&mut a, i)),
-                                None => KAct::None,
-                            }
-                        }
-                        0x1B => {
-                            // VK_ESCAPE: dismiss, hand focus back untouched.
-                            let restore = a.target;
-                            hide_popup(&mut a);
-                            KAct::Dismiss(restore)
-                        }
-                        _ => KAct::None,
-                    }
-                };
-                match act {
-                    KAct::Paste(target) if !target.is_null() => {
-                        SetForegroundWindow(target);
-                        std::thread::sleep(Duration::from_millis(40));
-                        send_combo(0x56); // Ctrl+V
-                    }
-                    KAct::Dismiss(restore) if !restore.is_null() => {
-                        SetForegroundWindow(restore);
-                    }
-                    _ => {}
-                }
-                return 0;
-            }
-            if msg == WM_KEYDOWN && app().edit.is_some() {
-                match wp as u16 {
-                    0x1B => end_edit(false), // VK_ESCAPE: cancel
-                    0x0D => {
-                        // VK_RETURN: pin only when the trimmed label is non-empty.
-                        // On empty-Enter we intentionally do nothing, keeping the
-                        // field open to keep typing, rather than calling end_edit
-                        // (which would close it). Don't "simplify" into end_edit(true).
-                        let ready = app().edit.as_ref().is_some_and(|e| {
-                            !String::from_utf16_lossy(&e.label).trim().is_empty()
-                        });
-                        if ready {
-                            end_edit(true);
-                        }
-                    }
-                    _ => {}
-                }
-                return 0;
-            }
-            DefWindowProcW(hwnd, msg, wp, lp)
-        }
-        WM_CHAR => {
-            if app().edit.is_none() {
-                return DefWindowProcW(hwnd, msg, wp, lp);
-            }
-            match wp as u16 {
-                0x08 => {
-                    // Backspace: a preselected label clears whole (it's one
-                    // selection); otherwise drop the last code unit (plus its
-                    // surrogate pair).
-                    let mut a = app();
-                    if let Some(e) = a.edit.as_mut() {
-                        if e.preselected {
-                            e.label.clear();
-                            e.preselected = false;
-                        } else if let Some(last) = e.label.pop() {
-                            if (0xDC00..=0xDFFF).contains(&last)
-                                && matches!(e.label.last(), Some(&p) if (0xD800..=0xDBFF).contains(&p)) {
-                                    e.label.pop();
-                                }
-                        }
-                    }
-                    a.caret_on = true;
-                    InvalidateRect(hwnd, null(), 0);
-                }
-                0x1B | 0x0D | 0x09 => {} // Esc/Enter handled in WM_KEYDOWN; ignore Tab
-                c if c < 0x20 => {}      // ignore other control chars
-                c => {
-                    let mut a = app();
-                    if let Some(e) = a.edit.as_mut() {
-                        if e.preselected {
-                            // First keystroke replaces the preselected suggestion.
-                            e.label.clear();
-                            e.preselected = false;
-                        }
-                        if e.label.len() < 200 {
-                            e.label.push(c);
-                        }
-                    }
-                    a.caret_on = true;
-                    InvalidateRect(hwnd, null(), 0);
-                }
-            }
-            0
-        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => on_key_down(hwnd, msg, wp, lp),
+        WM_CHAR => on_char(hwnd, msg, wp, lp),
         WM_PAINT => {
             paint(hwnd);
             0
         }
-        WM_HOTKEY => {
-            enum HAct {
-                None,
-                Focus(HWND),   // popup opened: grab keyboard focus for nav
-                Dismiss(HWND), // hotkey while open acts as a toggle
-            }
-            let act = {
-                let mut a = app();
-                if a.paused || a.capturing {
-                    HAct::None
-                } else if a.visible {
-                    let restore = a.target;
-                    hide_popup(&mut a);
-                    HAct::Dismiss(restore)
-                } else {
-                    a.target = GetForegroundWindow();
-                    let (x, y) = caret_or_cursor(a.target);
-                    show_popup(&mut a, x, y);
-                    if a.visible {
-                        // Start the selection on the first row so arrows work
-                        // immediately.
-                        a.hovered = a
-                            .rows
-                            .iter()
-                            .position(|r| !matches!(r.kind, RowKind::Sep))
-                            .map_or(-1, |i| i as i32);
-                        a.kb_focus = true;
-                        HAct::Focus(a.hwnd)
-                    } else {
-                        HAct::None // nothing to show (empty history + pins)
-                    }
-                }
-            };
-            // Focus calls outside the borrow: they can deliver messages
-            // synchronously (see the WM_KILLFOCUS lesson).
-            match act {
-                HAct::Focus(hwnd2) => {
-                    set_no_activate(hwnd2, false);
-                    SetForegroundWindow(hwnd2);
-                    SetFocus(hwnd2);
-                }
-                HAct::Dismiss(restore) => {
-                    if !restore.is_null() {
-                        SetForegroundWindow(restore);
-                    }
-                }
-                HAct::None => {}
-            }
-            0
-        }
+        WM_HOTKEY => on_hotkey(),
         WM_APP_CAPTURED => {
             finish_capture(decode_trigger(wp));
             0
@@ -3367,84 +3053,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
-        WM_COMMAND => {
-            match wp & 0xffff {
-                ID_PAUSE => {
-                    let mut a = app();
-                    a.paused = !a.paused;
-                    if a.paused {
-                        hide_popup(&mut a);
-                    }
-                    reconcile_input(&mut a); // pause fully removes the hook/hotkey
-                }
-                ID_CLEAR => {
-                    let mut a = app();
-                    a.history.iter_mut().for_each(scrub_clip);
-                    a.history.clear();
-                    a.history_dirty = false;
-                    if a.persist {
-                        clear_history_file(); // wipe the persisted copy too
-                    }
-                    hide_popup(&mut a);
-                }
-                ID_QUIT => {
-                    DestroyWindow(hwnd);
-                }
-                ID_ABOUT => {
-                    let mut pt: POINT = std::mem::zeroed();
-                    GetCursorPos(&mut pt);
-                    show_about(&mut app(), pt.x, pt.y);
-                }
-                ID_STARTUP => set_startup(!startup_enabled()),
-                ID_PERSIST => {
-                    let mut a = app();
-                    a.persist = !a.persist;
-                    save_settings(&a);
-                    if a.persist {
-                        save_history(&a); // capture what's already in memory
-                    } else {
-                        clear_history_file(); // stop remembering: delete the file
-                    }
-                }
-                ID_AUTOCOPY => {
-                    let mut a = app();
-                    a.auto_copy = !a.auto_copy;
-                    save_settings(&a);
-                    reconcile_input(&mut a); // install/remove the hook for drag-watching
-                }
-                ID_KBOPEN => {
-                    let (hwnd2, failed) = {
-                        let mut a = app();
-                        a.kb_open = !a.kb_open;
-                        reconcile_input(&mut a);
-                        save_settings(&a);
-                        // While paused nothing registers by design, that's not
-                        // a conflict.
-                        (a.hwnd, a.kb_open && !a.paused && !a.nav_active)
-                    };
-                    let desc = open_desc(&app());
-                    update_tray_tip(hwnd2, &desc);
-                    if failed {
-                        // Another app owns Ctrl+Shift+V; the setting stays on and
-                        // registration retries on the next resume/toggle.
-                        warn_hotkey_taken(hwnd2);
-                    }
-                }
-                ID_TRIG_CUSTOM => start_capture(),
-                cmd => {
-                    if let Some(&(_, t, _)) = PRESETS.iter().find(|&&(id, _, _)| id == cmd) {
-                        set_trigger(t);
-                    } else if (ID_THEME_BASE..ID_THEME_BASE + THEMES.len()).contains(&cmd) {
-                        let mut a = app();
-                        a.theme_idx = cmd - ID_THEME_BASE;
-                        set_theme(a.theme_idx);
-                        save_settings(&a);
-                        InvalidateRect(a.hwnd, null(), 1); // repaint in the new theme
-                    }
-                }
-            }
-            0
-        }
+        WM_COMMAND => on_command(hwnd, wp),
         WM_DESTROY => {
             cleanup(hwnd);
             PostQuitMessage(0);
@@ -3850,22 +3459,6 @@ mod tests {
     }
 
     #[test]
-    fn split_rows_gives_pins_the_rows_they_earn() {
-        let t = TOTAL_VISIBLE;
-        // 8 or fewer pins: identical to the old fixed 20/8 layout.
-        assert_eq!(split_rows(50, 0, t), (20, 0));
-        assert_eq!(split_rows(50, 8, t), (20, 8));
-        assert_eq!(split_rows(5, 3, t), (5, 3));
-        // More pins: pins grow, history shrinks toward the 28-row budget.
-        assert_eq!(split_rows(50, 12, t), (16, 12));
-        assert_eq!(split_rows(50, 20, t), (8, 20));
-        // Pins past their cap scroll instead of growing further.
-        assert_eq!(split_rows(50, 99, t), (8, 20));
-        // Short history never pads the budget.
-        assert_eq!(split_rows(3, 25, t), (3, 20));
-    }
-
-    #[test]
     fn fit_box_shrinks_but_never_grows() {
         assert_eq!(fit_box(100, 50, 800, 600), (100, 50)); // already fits: untouched
         assert_eq!(fit_box(1920, 1080, 800, 900), (800, 450)); // width-bound
@@ -3886,18 +3479,6 @@ mod tests {
     }
 
     #[test]
-    fn split_rows_respects_a_clamped_budget() {
-        // Small monitor: both sections share what fits, history keeps its 8.
-        assert_eq!(split_rows(50, 30, 16), (8, 8));
-        // Short history cedes its reserve to pins.
-        assert_eq!(split_rows(2, 30, 16), (2, 14));
-        // No pins: history takes the whole clamped budget.
-        assert_eq!(split_rows(50, 0, 10), (10, 0));
-        // Degenerate budget never underflows.
-        assert_eq!(split_rows(50, 30, 1), (1, 0));
-    }
-
-    #[test]
     fn suggest_label_takes_a_short_first_line() {
         assert_eq!(suggest_label("Aria"), "Aria");
         assert_eq!(suggest_label("  padded  "), "padded");
@@ -3908,55 +3489,6 @@ mod tests {
         let long = "word ".repeat(20);
         let s = suggest_label(&long);
         assert!(s.chars().count() <= 40 && !s.ends_with(' '), "got {s:?}");
-    }
-
-    /// `h` history rows, then (if `p > 0`) a separator and `p` pin rows,
-    /// mirroring rebuild_rows' layout. Row heights don't matter to nav_step.
-    fn nav_rows(h: usize, p: usize) -> Vec<VRow> {
-        let mut rows: Vec<VRow> = (0..h)
-            .map(|i| VRow { kind: RowKind::Hist(i), top: 0, bottom: 0 })
-            .collect();
-        if p > 0 {
-            rows.push(VRow { kind: RowKind::Sep, top: 0, bottom: 0 });
-            rows.extend((0..p).map(|j| VRow { kind: RowKind::Pin(j), top: 0, bottom: 0 }));
-        }
-        rows
-    }
-
-    #[test]
-    fn nav_enters_at_the_near_end() {
-        let rows = nav_rows(3, 2);
-        assert_eq!(nav_step(&rows, -1, true, false, false), (0, 0, 0)); // Down: first hist
-        assert_eq!(nav_step(&rows, -1, false, false, false), (5, 0, 0)); // Up: last pin
-    }
-
-    #[test]
-    fn nav_steps_within_a_section_and_skips_the_separator() {
-        let rows = nav_rows(3, 2);
-        assert_eq!(nav_step(&rows, 0, true, false, false), (1, 0, 0));
-        assert_eq!(nav_step(&rows, 2, true, false, false), (4, 0, 0)); // hist end -> first pin
-        assert_eq!(nav_step(&rows, 4, false, false, false), (2, 0, 0)); // first pin -> hist end
-    }
-
-    #[test]
-    fn nav_scrolls_a_section_before_leaving_it() {
-        let rows = nav_rows(3, 2);
-        // More history below: Down at the last hist row scrolls, selection stays.
-        assert_eq!(nav_step(&rows, 2, true, true, false), (2, 1, 0));
-        // More history above: Up at the first hist row scrolls up.
-        assert_eq!(nav_step(&rows, 0, false, true, false), (0, -1, 0));
-        // Pins likewise, in both directions.
-        assert_eq!(nav_step(&rows, 5, true, false, true), (5, 0, 1));
-        assert_eq!(nav_step(&rows, 4, false, false, true), (4, 0, -1));
-    }
-
-    #[test]
-    fn nav_stops_at_the_true_ends() {
-        let rows = nav_rows(3, 2);
-        assert_eq!(nav_step(&rows, 5, true, false, false), (5, 0, 0)); // bottom: stay
-        assert_eq!(nav_step(&rows, 0, false, false, false), (0, 0, 0)); // top: stay
-        let hist_only = nav_rows(2, 0);
-        assert_eq!(nav_step(&hist_only, 1, true, false, false), (1, 0, 0));
     }
 
     #[test]
