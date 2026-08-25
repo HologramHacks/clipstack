@@ -1713,8 +1713,7 @@ struct AboutLayout {
     icon: RECT,
     title_y: i32,
     tagline_y: i32,
-    web: (i32, i32), // (top, bottom) of the clickable link band
-    gh: (i32, i32),
+    gh: (i32, i32), // (top, bottom) of the clickable link band
     footer_y: i32,
     height: i32,
 }
@@ -1736,13 +1735,11 @@ fn about_layout(a: &App) -> AboutLayout {
     y += lh;
     let tagline_y = y;
     y += lh + pad;
-    let web = (y, y + lh);
-    y += lh;
     let gh = (y, y + lh);
     y += lh + pad;
     let footer_y = y;
     y += lh + pad * 2;
-    AboutLayout { icon, title_y, tagline_y, web, gh, footer_y, height: y }
+    AboutLayout { icon, title_y, tagline_y, gh, footer_y, height: y }
 }
 
 /// Open the About panel near the cursor, an on-brand dark card, not a MessageBox.
@@ -1791,7 +1788,6 @@ unsafe fn paint_about(hdc: HDC, a: &App, rc: &RECT) {
     SetTextColor(hdc, theme().dim);
     draw_center(hdc, a, lay.tagline_y, &wide_no_nul(ABOUT_TAGLINE));
     SetTextColor(hdc, theme().accent);
-    draw_center(hdc, a, lay.web.0, &wide_no_nul("hologramhacks.com"));
     draw_center(hdc, a, lay.gh.0, &wide_no_nul("github.com/HologramHacks/clipstack"));
     SetTextColor(hdc, theme().dim);
     draw_center(hdc, a, lay.footer_y, &wide_no_nul("Built by Brian Jones"));
@@ -2587,9 +2583,7 @@ unsafe fn on_lbutton_up(hwnd: HWND, lp: LPARAM) -> LRESULT {
         if app().about {
             let (_, y) = lo_hi(lp);
             let lay = about_layout(&app());
-            if y >= lay.web.0 && y < lay.web.1 {
-                open_url(hwnd, "https://hologramhacks.com");
-            } else if y >= lay.gh.0 && y < lay.gh.1 {
+            if y >= lay.gh.0 && y < lay.gh.1 {
                 open_url(hwnd, "https://github.com/HologramHacks/clipstack");
             } else {
                 hide_popup(&mut app());
