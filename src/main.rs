@@ -676,7 +676,7 @@ unsafe fn clip_set_image(hwnd: HWND, w: usize, h: usize, rgba: &[u8]) -> bool {
     dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
     dib.extend_from_slice(&((w * h * 4) as u32).to_le_bytes()); // biSizeImage
     dib.extend_from_slice(&[0u8; 16]); // x/y ppm, clrUsed, clrImportant
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         dib.extend_from_slice(&[px[2], px[1], px[0], px[3]]); // RGBA -> BGRA
     }
     if !open_clipboard_retry(hwnd) {

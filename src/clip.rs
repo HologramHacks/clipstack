@@ -156,8 +156,8 @@ pub fn dib_to_rgba(d: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
         }
     }
     // 32-bit DIBs often leave alpha as 0 (undefined); treat all-zero as opaque.
-    if bpp == 32 && out.chunks_exact(4).all(|p| p[3] == 0) {
-        for p in out.chunks_exact_mut(4) {
+    if bpp == 32 && out.as_chunks::<4>().0.iter().all(|p| p[3] == 0) {
+        for p in out.as_chunks_mut::<4>().0 {
             p[3] = 255;
         }
     }
