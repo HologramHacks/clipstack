@@ -109,4 +109,4 @@ MIT, see [LICENSE](LICENSE).
 
 ---
 
-Built by Brian Jones, [hologramhacks.com](https://hologramhacks.com)
+Built by Brian Jones.
