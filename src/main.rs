@@ -239,6 +239,7 @@ struct App {
     kb_open: bool,        // setting: Ctrl+Shift+V always opens the popup (default on)
     nav_active: bool,     // the Ctrl+Shift+V opener is currently registered
     kb_focus: bool,       // popup was opened via hotkey and holds keyboard focus
+    mouse_anchor: Option<(i32, i32)>, // pointer position at keyboard-open, until it really moves
     capturing: bool,      // listening for a custom trigger
     about: bool,          // showing the About panel
     toast: Option<String>, // transient inline message at the bottom of the popup
@@ -1186,6 +1187,32 @@ unsafe fn caret_or_cursor(target: HWND) -> (i32, i32) {
 }
 
 
+/// A pointer this far (Manhattan, in screen pixels) from where it sat when the
+/// keyboard opened the popup counts as the user reaching for the mouse.
+const MOUSE_TAKEOVER_SLOP: i32 = 4;
+
+/// Should a mouse message be allowed to move the selection?
+///
+/// Opening the popup from the keyboard puts it at the text caret, which has
+/// nothing to do with where the pointer happens to be resting. A window that
+/// appears under a stationary pointer still gets a mouse-move message, and a
+/// real mouse jitters a pixel or two sitting on a desk. Either one would hand
+/// the selection to whatever row the pointer is over, so hover only takes over
+/// once the pointer has genuinely moved.
+fn mouse_took_over(anchor: Option<(i32, i32)>, cur: (i32, i32)) -> bool {
+    match anchor {
+        None => true, // mouse-opened popup: hover has always owned the selection
+        Some((ax, ay)) => (cur.0 - ax).abs() + (cur.1 - ay).abs() > MOUSE_TAKEOVER_SLOP,
+    }
+}
+
+/// Where the pointer is now, in screen coordinates.
+unsafe fn cursor_pos() -> (i32, i32) {
+    let mut pt: POINT = std::mem::zeroed();
+    GetCursorPos(&mut pt);
+    (pt.x, pt.y)
+}
+
 // ---- Image hover preview ---------------------------------------------------
 
 /// History index of the image clip the hover/selection is resting on, if the
@@ -1429,6 +1456,8 @@ fn hide_popup(a: &mut App) {
     a.visible = false;
     a.hovered = -1;
     a.arm_delete = None;
+    a.mouse_anchor = None;
+    a.tracking_leave = false; // re-arm mouse tracking on the next open
     unsafe { reconcile_input(a) }; // drop the hook again if a keyboard trigger
 }
 
@@ -2548,6 +2577,10 @@ unsafe fn on_mouse_move(hwnd: HWND, lp: LPARAM) -> LRESULT {
         if a.edit.is_some() {
             return 0; // no hover changes while a label field is open
         }
+        if !mouse_took_over(a.mouse_anchor, cursor_pos()) {
+            return 0; // the pointer has not moved since the keyboard opened this
+        }
+        a.mouse_anchor = None; // the mouse moved for real, it owns the selection now
         let (_, y) = lo_hi(lp);
         if !a.tracking_leave {
             let mut tme = TRACKMOUSEEVENT {
@@ -2861,6 +2894,7 @@ unsafe fn on_hotkey() -> LRESULT {
                         .position(|r| !matches!(r.kind, RowKind::Sep))
                         .map_or(-1, |i| i as i32);
                     a.kb_focus = true;
+                    a.mouse_anchor = Some(cursor_pos());
                     HAct::Focus(a.hwnd)
                 } else {
                     HAct::None // nothing to show (empty history + pins)
@@ -2983,9 +3017,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSEMOVE => on_mouse_move(hwnd, lp),
         WM_MOUSELEAVE => {
             let mut a = app();
+            a.tracking_leave = false;
+            if a.mouse_anchor.is_some() {
+                // Keyboard still owns the selection (the pointer never moved).
+                // Showing the preview panel under a resting pointer counts as a
+                // leave, and acting on it would cancel the very preview that
+                // triggered it.
+                return 0;
+            }
             a.hovered = -1;
             a.arm_delete = None; // disarm any pending pin-delete on leave
-            a.tracking_leave = false;
             hide_preview(&mut a);
             KillTimer(hwnd, TIMER_PREVIEW);
             InvalidateRect(hwnd, null(), 1);
@@ -3284,6 +3325,7 @@ fn main() {
             kb_open,
             nav_active: false,
             kb_focus: false,
+            mouse_anchor: None,
             capturing: false,
             about: false,
             toast: None,
@@ -3397,6 +3439,22 @@ mod tests {
 
     /// A DPAPI round-trip through the real files, plus the guarantee that a
     /// write leaves no .tmp behind.
+    /// Frank's bug: opening from the keyboard puts the popup at the caret, and
+    /// a pointer already resting inside it stole the selection (jumping it into
+    /// the pin section) and cancelled the image preview.
+    #[test]
+    fn a_resting_pointer_does_not_steal_the_keyboard_selection() {
+        let anchor = Some((500, 400));
+        assert!(!mouse_took_over(anchor, (500, 400)), "a window appearing under the pointer");
+        assert!(!mouse_took_over(anchor, (502, 400)), "sensor jitter on a still mouse");
+        assert!(!mouse_took_over(anchor, (498, 402)), "jitter in both axes");
+        // A deliberate move hands the selection back to hover.
+        assert!(mouse_took_over(anchor, (520, 400)));
+        assert!(mouse_took_over(anchor, (500, 380)));
+        // A mouse-opened popup has no anchor, so hover always drives it.
+        assert!(mouse_took_over(None, (500, 400)));
+    }
+
     #[test]
     fn encrypted_write_roundtrips_and_leaves_no_temp() {
         let dir = std::env::temp_dir().join(format!("clipstack-enc-{}", std::process::id()));
